@@ -8,7 +8,7 @@ UI_PORT=8099
 if [ ! -f "$CONFIG_PATH" ]; then
     echo "No config found at $CONFIG_PATH — writing a starter config." >&2
     mkdir -p "$(dirname "$CONFIG_PATH")"
-    cp /app/config.example.yaml "$CONFIG_PATH" 2>/dev/null || cat > "$CONFIG_PATH" <<'EOF'
+    cat > "$CONFIG_PATH" <<'EOF'
 events_dir: /config/events
 cameras:
   - name: front-door
