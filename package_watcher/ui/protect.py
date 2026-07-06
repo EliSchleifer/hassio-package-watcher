@@ -55,6 +55,29 @@ def list_cameras(cfg: UnifiConfig) -> list[dict[str, Any]]:
     return asyncio.run(_with_client(cfg, _fn))
 
 
+def get_snapshots(cfg: UnifiConfig, camera_id: str,
+                  timestamps: list[datetime], width: int = 320
+                  ) -> list[Optional[bytes]]:
+    """Fetch small JPEG snapshots at each timestamp, reusing one session.
+
+    Cheap enough to build a scrubbing timeline from (each is a downscaled
+    frame, ~tens of KB) — the opposite of downloading a whole window of video.
+    Missing frames come back as None rather than aborting the batch.
+    """
+    async def _fn(client):
+        cam = client.bootstrap.cameras.get(camera_id)
+        if cam is None:
+            raise ValueError(f"no Protect camera with id {camera_id!r}")
+        shots: list[Optional[bytes]] = []
+        for dt in timestamps:
+            try:
+                shots.append(await cam.get_snapshot(width=width, dt=dt))
+            except Exception:  # noqa: BLE001
+                shots.append(None)
+        return shots
+    return asyncio.run(_with_client(cfg, _fn))
+
+
 def pull_clip(cfg: UnifiConfig, camera_id: str, start: datetime,
               end: datetime, output_path: str) -> str:
     """Download recorded footage [start, end] for a camera to output_path."""

@@ -129,6 +129,44 @@ def test_discover_unifi_protect_absent(tmp_path, monkeypatch):
     assert hass.discover_unifi_protect() is None
 
 
+def test_filmstrip_returns_thumbnails(client, monkeypatch):
+    from package_watcher.ui import hass, protect
+    from package_watcher.config import UnifiConfig
+
+    monkeypatch.setattr(hass, "discover_unifi_protect",
+                        lambda: UnifiConfig(host="10.0.0.5", api_key="k"))
+    monkeypatch.setattr(protect, "available", lambda: True)
+    captured = {}
+
+    def fake_snaps(cfg, cam, times, width=320):
+        captured["n"] = len(times)
+        captured["cam"] = cam
+        # one missing frame in the middle to exercise the None path
+        return [b"\xff\xd8jpeg" if i != 2 else None for i in range(len(times))]
+
+    monkeypatch.setattr(protect, "get_snapshots", fake_snaps)
+    c, _ = client
+    r = c.post("/api/filmstrip", json={"camera_id": "abc",
+                                       "start": "2026-07-05T15:30:00+00:00",
+                                       "window_s": 300, "count": 6})
+    body = r.get_json()
+    assert r.status_code == 200
+    assert captured["n"] == 6 and captured["cam"] == "abc"
+    assert len(body["thumbs"]) == 6
+    assert body["thumbs"][0]["jpg"].startswith("data:image/jpeg;base64,")
+    assert body["thumbs"][2]["jpg"] is None          # missing frame
+    assert body["thumbs"][-1]["t_s"] == 300.0        # last frame at window end
+
+
+def test_filmstrip_requires_protect(client, monkeypatch):
+    from package_watcher.ui import hass
+    monkeypatch.setattr(hass, "discover_unifi_protect", lambda: None)
+    monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+    c, _ = client
+    r = c.post("/api/filmstrip", json={"camera_id": "x", "start": "2026-07-05T15:30:00"})
+    assert r.status_code == 400
+
+
 def test_cameras_use_discovered_protect(client, monkeypatch):
     from package_watcher.ui import hass, protect
     from package_watcher.config import UnifiConfig

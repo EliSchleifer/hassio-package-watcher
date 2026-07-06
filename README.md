@@ -191,15 +191,16 @@ package-watcher ui --config config.yaml --fixtures fixtures   # http://127.0.0.1
 
 The web UI lets you build fixtures from real cameras without touching YAML:
 
-1. **Grab a clip** — pick a Protect camera and a begin/end time to pull the
-   recorded footage (works for a direct Protect NVR *or* one exposed through
-   Home Assistant — same backend), or upload a local file, or point at an
-   existing clip. When running as the Home Assistant add-on, the camera list
-   is populated automatically from your HA `camera.*` entities (via the Core
-   API — no `unifi` block needed just to *see* them). Note that pulling a
-   *recorded* clip by time range is Protect-specific, so it still needs a
-   `unifi` block with NVR credentials; for other HA cameras, upload footage or
-   reference an existing clip.
+1. **Grab a clip** — pick a Protect camera, choose a start time and window,
+   and **scrub a thumbnail timeline** (cheap downscaled snapshots, no video
+   download) to find the moment; click a frame for the **In** point and
+   another for **Out**, *Zoom to selection* to refine, then pull just that
+   short range as the clip. Or upload a local file, or point at an existing
+   clip. When running as the Home Assistant add-on, the camera list is
+   populated automatically from your HA `camera.*` entities, and Protect NVR
+   credentials are reused from the HA UniFi Protect integration — so scrubbing
+   and clip pull work with no `unifi` block. (Non-Protect HA cameras have no
+   recorded backend, so for those upload footage or reference a clip.)
 2. **Label it** — "should detect" / "should NOT", optional expected region and
    time window.
 3. **Preview** — runs the detector and shows what it found (annotated frame +
