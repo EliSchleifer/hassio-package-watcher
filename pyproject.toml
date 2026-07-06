@@ -17,7 +17,8 @@ dependencies = [
 
 [project.optional-dependencies]
 unifi = ["uiprotect>=6.0"]
-dev = ["pytest>=8.0"]
+ui = ["flask>=3.0"]
+dev = ["pytest>=8.0", "flask>=3.0"]
 
 [project.scripts]
 package-watcher = "package_watcher.__main__:main"
