@@ -97,6 +97,56 @@ def test_cameras_from_home_assistant(client, monkeypatch):
     assert body["cameras"][0]["name"] == "Porch"
 
 
+def _write_config_entries(ha_dir, entries):
+    import json
+    storage = ha_dir / ".storage"
+    storage.mkdir(parents=True)
+    (storage / "core.config_entries").write_text(
+        json.dumps({"version": 1, "data": {"entries": entries}}))
+
+
+def test_discover_unifi_protect_from_storage(tmp_path, monkeypatch):
+    from package_watcher.ui import hass
+
+    _write_config_entries(tmp_path, [
+        {"domain": "sun", "data": {}},
+        {"domain": "unifiprotect", "data": {
+            "host": "10.0.0.5", "port": 443, "username": "u", "password": "p",
+            "api_key": "k", "verify_ssl": False}},
+    ])
+    monkeypatch.setenv("PACKAGE_WATCHER_HA_CONFIG", str(tmp_path))
+    cfg = hass.discover_unifi_protect()
+    assert cfg is not None
+    assert (cfg.host, cfg.port, cfg.username, cfg.api_key) == \
+        ("10.0.0.5", 443, "u", "k")
+
+
+def test_discover_unifi_protect_absent(tmp_path, monkeypatch):
+    from package_watcher.ui import hass
+
+    _write_config_entries(tmp_path, [{"domain": "sun", "data": {}}])
+    monkeypatch.setenv("PACKAGE_WATCHER_HA_CONFIG", str(tmp_path))
+    assert hass.discover_unifi_protect() is None
+
+
+def test_cameras_use_discovered_protect(client, monkeypatch):
+    from package_watcher.ui import hass, protect
+    from package_watcher.config import UnifiConfig
+
+    monkeypatch.setattr(hass, "discover_unifi_protect",
+                        lambda: UnifiConfig(host="10.0.0.5", api_key="k"))
+    monkeypatch.setattr(protect, "available", lambda: True)
+    monkeypatch.setattr(protect, "list_cameras",
+                        lambda cfg: [{"id": "abc", "name": "G4 Doorbell"}])
+    c, _ = client
+    body = c.get("/api/cameras").get_json()
+    assert body["available"] is True
+    assert body["source"] == "protect"
+    assert body["discovered"] is True
+    assert body["supports_pull"] is True
+    assert body["cameras"][0]["name"] == "G4 Doorbell"
+
+
 def test_save_new_case_appends_and_preserves(client):
     c, fixtures = client
     payload = {

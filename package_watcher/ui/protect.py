@@ -31,7 +31,7 @@ async def _with_client(cfg: UnifiConfig, fn):
 
     client = ProtectApiClient(
         cfg.host, cfg.port, cfg.username, cfg.password,
-        verify_ssl=cfg.verify_ssl)
+        api_key=cfg.api_key, verify_ssl=cfg.verify_ssl)
     try:
         await client.update()
         return await fn(client)

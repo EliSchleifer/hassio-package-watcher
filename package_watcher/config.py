@@ -41,8 +41,9 @@ class CameraConfig:
 @dataclass
 class UnifiConfig:
     host: str
-    username: str
-    password: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+    api_key: Optional[str] = None   # newer Protect integrations use an API key
     port: int = 443
     verify_ssl: bool = False
     trigger_types: list[str] = field(default_factory=lambda: ["person"])
