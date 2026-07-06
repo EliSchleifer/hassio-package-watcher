@@ -48,7 +48,13 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None):
     # --- pages ------------------------------------------------------------
     @app.get("/")
     def index() -> Any:
-        return _PAGE
+        # Under Home Assistant ingress the page is served from a token-prefixed
+        # path (e.g. /api/hassio_ingress/<token>/); HA passes that prefix in
+        # X-Ingress-Path. Emitting it as the document <base> lets every
+        # relative fetch/img URL below resolve correctly both there and when
+        # run standalone (prefix empty -> base "/").
+        prefix = request.headers.get("X-Ingress-Path", "").rstrip("/")
+        return _PAGE.replace("__INGRESS_BASE__", prefix)
 
     # --- case data --------------------------------------------------------
     @app.get("/api/cases")
@@ -274,6 +280,7 @@ def serve(fixtures_dir: str, unifi: Optional[UnifiConfig],
 
 _PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
+<base href="__INGRESS_BASE__/">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>package-watcher · fixtures</title>
 <style>
@@ -369,7 +376,7 @@ _PAGE = """<!doctype html>
 async function j(url, opts){ const r = await fetch(url, opts); return r.json(); }
 
 async function loadCases(){
-  const cases = await j('/api/cases');
+  const cases = await j('api/cases');
   const tb = document.querySelector('#cases tbody');
   tb.innerHTML = '';
   for(const c of cases){
@@ -386,7 +393,7 @@ function cssId(s){ return s.replace(/[^a-z0-9]/gi,'_'); }
 
 async function runAll(){
   document.getElementById('summary').textContent = 'running…';
-  const res = await j('/api/run', {method:'POST'});
+  const res = await j('api/run', {method:'POST'});
   let pass=0, fail=0, skip=0;
   for(const r of res){
     const cell = document.getElementById('st-'+cssId(r.name));
@@ -399,7 +406,7 @@ async function runAll(){
 }
 
 async function loadCameras(){
-  const res = await j('/api/cameras');
+  const res = await j('api/cameras');
   const sel = document.getElementById('camera');
   sel.innerHTML = '';
   if(!res.available){
@@ -418,7 +425,7 @@ async function pullClip(){
     start: document.getElementById('start').value,
     end: document.getElementById('end').value };
   msg('saveMsg','pulling clip from Protect…');
-  const res = await j('/api/pull', {method:'POST',
+  const res = await j('api/pull', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   if(res.error){ msg('saveMsg','pull failed: '+res.error); return; }
   document.getElementById('clip').value = res.clip;
@@ -429,7 +436,7 @@ async function uploadClip(){
   const f = document.getElementById('upload').files[0];
   if(!f) return;
   const fd = new FormData(); fd.append('file', f);
-  const res = await j('/api/upload', {method:'POST', body: fd});
+  const res = await j('api/upload', {method:'POST', body: fd});
   if(res.error){ msg('saveMsg', res.error); return; }
   document.getElementById('clip').value = res.clip;
   msg('saveMsg','uploaded '+res.clip);
@@ -454,7 +461,7 @@ function formCase(){
 }
 
 async function saveCase(){
-  const res = await j('/api/save_case', {method:'POST',
+  const res = await j('api/save_case', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(formCase())});
   if(res.error){ msg('saveMsg','save failed: '+res.error); return; }
   msg('saveMsg','saved '+res.saved);
@@ -468,7 +475,7 @@ async function preview(name){
   if(!target){ msg('saveMsg','name a case (or click preview on a row)'); return; }
   const div = document.getElementById('preview');
   const bust = 't=' + Date.now();
-  const url = k => `/api/preview/${encodeURIComponent(target)}.png?${bust}&kind=${k}`;
+  const url = k => `api/preview/${encodeURIComponent(target)}.png?${bust}&kind=${k}`;
   div.innerHTML = `<h2>Preview: ${target}</h2>
     <div class="row">
       <div><div class="muted">detection</div>

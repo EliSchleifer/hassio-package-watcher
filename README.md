@@ -134,6 +134,15 @@ Repositories**, install *Package Watcher*, start it once to generate a
 starter config in the add-on's config folder, edit it, restart. Point
 `sinks.webhook_url` at a HA webhook to drive automations.
 
+The add-on runs the watcher **and** the fixture-authoring UI in one container:
+the UI is exposed through Home Assistant **ingress**, so it shows up as a
+*Package Watcher* item in the sidebar (open the add-on → *Open Web UI*) with no
+extra port to forward or authenticate. The detection service starts
+automatically once you've replaced the placeholder camera in the config;
+until then only the UI comes up, so you can author fixtures right away.
+Fixtures are written to `fixtures_path` (default `/config/fixtures`) in the
+add-on config folder and persist across restarts.
+
 ## Configuration
 
 See [`config.example.yaml`](config.example.yaml) — every knob is commented.
