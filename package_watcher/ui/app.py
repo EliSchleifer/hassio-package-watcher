@@ -15,9 +15,10 @@ Single-file app with embedded templates so it has no asset build step.
 
 from __future__ import annotations
 
+import base64
 import io
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import yaml
@@ -161,6 +162,40 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None):
                         "reason": "no unifi block, no discoverable Protect "
                                   "integration, and no Home Assistant API "
                                   "(run as an add-on with homeassistant_api)"})
+
+    @app.post("/api/filmstrip")
+    def api_filmstrip() -> Any:
+        """Cheap scrubbing: N downscaled JPEG snapshots evenly spaced across a
+        window, so the UI can build a Protect-style thumbnail timeline without
+        downloading any video."""
+        from . import protect
+        u, _ = _resolve_unifi()
+        if u is None or not protect.available():
+            return jsonify({"error": "Protect not configured"}), 400
+        data = request.get_json(force=True)
+        try:
+            start = datetime.fromisoformat(data["start"])
+            window_s = float(data.get("window_s", 300))
+            count = int(data.get("count", 16))
+            width = int(data.get("width", 320))
+        except (KeyError, ValueError) as exc:
+            return jsonify({"error": f"bad params: {exc}"}), 400
+        count = max(2, min(count, 40))
+        step = window_s / (count - 1)
+        times = [start + timedelta(seconds=step * i) for i in range(count)]
+        try:
+            shots = protect.get_snapshots(u, data["camera_id"], times, width=width)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 500
+        thumbs = [{
+            "i": i,
+            "t_s": round(step * i, 3),
+            "at": t.isoformat(),
+            "jpg": ("data:image/jpeg;base64," + base64.b64encode(s).decode())
+                   if s else None,
+        } for i, (t, s) in enumerate(zip(times, shots))]
+        return jsonify({"start": start.isoformat(), "window_s": window_s,
+                        "count": count, "thumbs": thumbs})
 
     @app.post("/api/pull")
     def api_pull() -> Any:
@@ -353,17 +388,29 @@ _PAGE = """<!doctype html>
     <h2>Add a case</h2>
     <fieldset>
       <legend>Source</legend>
-      <label>Protect camera (pull a recorded clip)</label>
+      <label>Protect camera — scrub recorded footage &amp; mark in/out</label>
       <div class="row">
         <select id="camera"><option value="">— none / unavailable —</option></select>
         <button onclick="loadCameras()">Refresh</button>
       </div>
       <div id="cameraNote" class="muted"></div>
       <div class="row">
-        <div><label>Begin (ISO)</label><input id="start" placeholder="2026-07-04T14:03:00"></div>
-        <div><label>End (ISO)</label><input id="end" placeholder="2026-07-04T14:04:30"></div>
+        <div><label>Start</label><input type="datetime-local" id="scrubStart"></div>
+        <div><label>Window</label>
+          <select id="scrubWindow">
+            <option value="120">2 min</option>
+            <option value="300" selected>5 min</option>
+            <option value="600">10 min</option>
+            <option value="1800">30 min</option>
+          </select></div>
       </div>
-      <button onclick="pullClip()">Pull clip from Protect</button>
+      <button onclick="loadStrip()">Load timeline</button>
+      <div id="strip"></div>
+      <div id="stripSel" class="muted"></div>
+      <div class="row" id="stripActions" style="display:none">
+        <button onclick="zoomSel()">🔍 Zoom to selection</button>
+        <button class="primary" onclick="makeClip()">Pull clip from selection</button>
+      </div>
       <label>…or upload a video file</label>
       <input type="file" id="upload" accept="video/*" onchange="uploadClip()">
       <label>…or reference an existing clip / leave blank for synthetic</label>
@@ -456,16 +503,91 @@ async function loadCameras(){
   }
 }
 
-async function pullClip(){
-  const body = { camera_id: document.getElementById('camera').value,
-    start: document.getElementById('start').value,
-    end: document.getElementById('end').value };
-  msg('saveMsg','pulling clip from Protect…');
+// --- Protect scrubbing: cheap thumbnail timeline, mark in/out, pull only
+// the selected range as video. No full-window download.
+let strip = null, inAt = null, outAt = null;
+
+async function loadStrip(){
+  const cam = document.getElementById('camera').value;
+  const startLocal = document.getElementById('scrubStart').value;
+  const win = parseFloat(document.getElementById('scrubWindow').value);
+  if(!cam){ msg('saveMsg','pick a camera'); return; }
+  if(!startLocal){ msg('saveMsg','set a start time'); return; }
+  // datetime-local is naive local time; send absolute UTC so the NVR agrees.
+  await fetchStrip(cam, new Date(startLocal).toISOString(), win);
+}
+
+async function fetchStrip(cam, startUtc, win){
+  msg('saveMsg','loading timeline…');
+  const res = await j('api/filmstrip', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({camera_id: cam, start: startUtc, window_s: win,
+                          count: 16, width: 320})});
+  if(res.error){ msg('saveMsg','timeline failed: '+res.error); return; }
+  strip = Object.assign({cam}, res); inAt = null; outAt = null;
+  renderStrip(); msg('saveMsg','timeline loaded — click a frame for In, another for Out');
+}
+
+function renderStrip(){
+  const el = document.getElementById('strip'); el.innerHTML = '';
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex;gap:2px;overflow-x:auto;padding:8px 0';
+  for(const t of strip.thumbs){
+    const cell = document.createElement('div');
+    cell.style.cssText = 'flex:0 0 auto;text-align:center;cursor:pointer';
+    cell.dataset.at = t.at;
+    cell.innerHTML = (t.jpg
+        ? `<img src="${t.jpg}" style="height:96px;display:block;border:3px solid transparent;border-radius:4px">`
+        : `<div style="height:96px;width:128px;background:var(--line);border-radius:4px"></div>`)
+      + `<div class="muted" style="font-size:10px">${new Date(t.at).toLocaleTimeString()}</div>`;
+    cell.onclick = () => pickThumb(t.at);
+    row.appendChild(cell);
+  }
+  el.appendChild(row);
+  document.getElementById('stripActions').style.display = 'flex';
+  highlight(); updateStripSel();
+}
+
+function pickThumb(at){
+  if(inAt === null || (inAt !== null && outAt !== null)){ inAt = at; outAt = null; }
+  else if(new Date(at) < new Date(inAt)){ outAt = inAt; inAt = at; }
+  else { outAt = at; }
+  highlight(); updateStripSel();
+}
+
+function highlight(){
+  document.querySelectorAll('#strip [data-at]').forEach(cell => {
+    const at = cell.dataset.at, img = cell.querySelector('img'); if(!img) return;
+    let c = 'transparent';
+    if(at === inAt) c = 'var(--ok)';
+    else if(at === outAt) c = 'var(--bad)';
+    else if(inAt && outAt && new Date(at) > new Date(inAt) && new Date(at) < new Date(outAt)) c = '#2f6fed';
+    img.style.borderColor = c;
+  });
+}
+
+function updateStripSel(){
+  const f = iso => iso ? new Date(iso).toLocaleTimeString() : '—';
+  let s = `in ${f(inAt)} · out ${f(outAt)}`;
+  if(inAt && outAt) s += ` · length ${Math.round((new Date(outAt)-new Date(inAt))/1000)}s`;
+  document.getElementById('stripSel').textContent = s;
+}
+
+function zoomSel(){
+  if(!inAt || !outAt){ msg('saveMsg','click an In frame and an Out frame first'); return; }
+  const win = (new Date(outAt) - new Date(inAt)) / 1000;
+  fetchStrip(strip.cam, inAt, Math.max(20, win));  // refetch finer thumbs in-range
+}
+
+async function makeClip(){
+  if(!inAt || !outAt){ msg('saveMsg','click an In frame and an Out frame first'); return; }
+  msg('saveMsg','pulling selected clip from Protect…');
   const res = await j('api/pull', {method:'POST',
-    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({camera_id: strip.cam, start: inAt, end: outAt})});
   if(res.error){ msg('saveMsg','pull failed: '+res.error); return; }
   document.getElementById('clip').value = res.clip;
-  msg('saveMsg','pulled '+res.clip);
+  msg('saveMsg','clip ready: '+res.clip+' — now name it and Save case');
 }
 
 async function uploadClip(){
