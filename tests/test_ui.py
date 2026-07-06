@@ -129,7 +129,7 @@ def test_discover_unifi_protect_absent(tmp_path, monkeypatch):
     assert hass.discover_unifi_protect() is None
 
 
-def test_filmstrip_returns_thumbnails(client, monkeypatch):
+def test_snapshot_returns_jpeg(client, monkeypatch):
     from package_watcher.ui import hass, protect
     from package_watcher.config import UnifiConfig
 
@@ -138,33 +138,57 @@ def test_filmstrip_returns_thumbnails(client, monkeypatch):
     monkeypatch.setattr(protect, "available", lambda: True)
     captured = {}
 
-    def fake_snaps(cfg, cam, times, width=320):
-        captured["n"] = len(times)
+    def fake_snap(cfg, cam, dt, width=640):
         captured["cam"] = cam
-        # one missing frame in the middle to exercise the None path
-        return [b"\xff\xd8jpeg" if i != 2 else None for i in range(len(times))]
+        captured["dt"] = dt
+        captured["width"] = width
+        return b"\xff\xd8jpegbytes"
 
-    monkeypatch.setattr(protect, "get_snapshots", fake_snaps)
+    monkeypatch.setattr(protect, "snapshot_at", fake_snap)
     c, _ = client
-    r = c.post("/api/filmstrip", json={"camera_id": "abc",
-                                       "start": "2026-07-05T15:30:00+00:00",
-                                       "window_s": 300, "count": 6})
-    body = r.get_json()
+    r = c.get("/api/snapshot?camera_id=abc&at=2026-07-05T15:30:00%2B00:00&width=480")
     assert r.status_code == 200
-    assert captured["n"] == 6 and captured["cam"] == "abc"
-    assert len(body["thumbs"]) == 6
-    assert body["thumbs"][0]["jpg"].startswith("data:image/jpeg;base64,")
-    assert body["thumbs"][2]["jpg"] is None          # missing frame
-    assert body["thumbs"][-1]["t_s"] == 300.0        # last frame at window end
+    assert r.mimetype == "image/jpeg"
+    assert r.data == b"\xff\xd8jpegbytes"
+    assert captured["cam"] == "abc" and captured["width"] == 480
+    assert captured["dt"].year == 2026
 
 
-def test_filmstrip_requires_protect(client, monkeypatch):
+def test_snapshot_requires_protect(client, monkeypatch):
     from package_watcher.ui import hass
     monkeypatch.setattr(hass, "discover_unifi_protect", lambda: None)
     monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
     c, _ = client
-    r = c.post("/api/filmstrip", json={"camera_id": "x", "start": "2026-07-05T15:30:00"})
+    r = c.get("/api/snapshot?camera_id=x&at=2026-07-05T15:30:00")
     assert r.status_code == 400
+
+
+def test_preview_case_runs_unsaved(client):
+    """The wizard's verify step grades a case that isn't in cases.yaml yet."""
+    c, _ = client
+    r = c.post("/api/preview_case", json={
+        "name": "adhoc-empty", "expect": "no_detect",
+        "scene": {"scene": "empty", "seconds": 8}, "fps": 2.0,
+    })
+    body = r.get_json()
+    assert r.status_code == 200
+    assert body["passed"] is True
+    assert "no detection" in body["reason"]
+    # nothing was written to the manifest
+    assert "adhoc-empty" not in [x["name"] for x in c.get("/api/cases").get_json()]
+
+
+def test_preview_case_reports_detection_image(client):
+    c, _ = client
+    r = c.post("/api/preview_case", json={
+        "name": "adhoc-pkg", "expect": "detect",
+        "scene": {"scene": "package", "hold_s": 14}, "fps": 2.0,
+        "detector": {"persist_samples": 6},
+    })
+    body = r.get_json()
+    assert r.status_code == 200
+    assert body["passed"] is True and body["detections"]
+    assert body["images"]["detection"].startswith("data:image/png;base64,")
 
 
 def test_cameras_use_discovered_protect(client, monkeypatch):

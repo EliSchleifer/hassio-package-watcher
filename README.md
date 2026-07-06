@@ -189,23 +189,29 @@ pip install ".[ui,unifi]"
 package-watcher ui --config config.yaml --fixtures fixtures   # http://127.0.0.1:8080
 ```
 
-The web UI lets you build fixtures from real cameras without touching YAML:
+The web UI's **+ Add a case** wizard walks you through building a fixture from
+real footage without touching YAML:
 
-1. **Grab a clip** — pick a Protect camera, choose a start time and window,
-   and **scrub a thumbnail timeline** (cheap downscaled snapshots, no video
-   download) to find the moment; click a frame for the **In** point and
-   another for **Out**, *Zoom to selection* to refine, then pull just that
-   short range as the clip. Or upload a local file, or point at an existing
-   clip. When running as the Home Assistant add-on, the camera list is
-   populated automatically from your HA `camera.*` entities, and Protect NVR
-   credentials are reused from the HA UniFi Protect integration — so scrubbing
-   and clip pull work with no `unifi` block. (Non-Protect HA cameras have no
-   recorded backend, so for those upload footage or reference a clip.)
-2. **Label it** — "should detect" / "should NOT", optional expected region and
-   time window.
-3. **Preview** — runs the detector and shows what it found (annotated frame +
-   diff mask) so you can confirm/tune before saving.
-4. **Save** — appends the case to `cases.yaml`; `pytest` grades it thereafter.
+1. **Source** — get the clip one of three ways, then **watch it inline** to
+   confirm it's the right footage:
+   - *Scrub Protect* — pick a camera and a start time; a **still preview**
+     appears immediately and a **timeline** lets you scrub (frames are fetched
+     on demand as JPEG snapshots — no video download) with ±1/±5/±30s stepping.
+     Mark **In** and **Out**, then pull just that short range as the clip.
+   - *Upload* a local video file, or *Reference* an existing clip / a synthetic
+     scene.
+
+   When running as the Home Assistant add-on, the camera list is populated
+   automatically from your HA `camera.*` entities, and Protect NVR credentials
+   are reused from the HA UniFi Protect integration — so scrubbing and clip
+   pull work with no `unifi` block. (Non-Protect HA cameras have no recorded
+   backend, so for those upload footage or reference a clip.)
+2. **Expectation** — name it, "should detect" / "should NOT", optional expected
+   region and time window, fps and persistence.
+3. **Verify & save** — runs the detector on the unsaved case and shows whether
+   it grades the way you intend (pass/fail + annotated frame + diff mask). Save
+   appends the case to `cases.yaml` and keeps the clip for future
+   training/validation; `pytest` grades it thereafter.
 
 "Run all" grades every case inline with pass/fail and the reason:
 
