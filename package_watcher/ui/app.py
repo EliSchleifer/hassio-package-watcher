@@ -125,18 +125,32 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None):
     # --- Protect + clips --------------------------------------------------
     @app.get("/api/cameras")
     def api_cameras() -> Any:
-        from . import protect
-        if unifi is None:
-            return jsonify({"available": False,
-                            "reason": "no unifi block in config"})
-        if not protect.available():
+        from . import hass, protect
+        # Prefer a configured Protect NVR: it can pull recorded clips by time
+        # range. Otherwise fall back to discovering camera.* entities straight
+        # from Home Assistant (works out of the box in the add-on, no
+        # credentials), which lists the cameras but can't fetch past footage.
+        if unifi is not None and protect.available():
+            try:
+                return jsonify({"available": True, "source": "protect",
+                                "supports_pull": True,
+                                "cameras": protect.list_cameras(unifi)})
+            except Exception as exc:  # noqa: BLE001
+                return jsonify({"available": False, "reason": str(exc)})
+        if hass.available():
+            try:
+                return jsonify({"available": True, "source": "homeassistant",
+                                "supports_pull": False,
+                                "cameras": hass.list_cameras()})
+            except Exception as exc:  # noqa: BLE001
+                return jsonify({"available": False,
+                                "reason": f"Home Assistant API: {exc}"})
+        if unifi is not None and not protect.available():
             return jsonify({"available": False,
                             "reason": "uiprotect not installed"})
-        try:
-            return jsonify({"available": True,
-                            "cameras": protect.list_cameras(unifi)})
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"available": False, "reason": str(exc)})
+        return jsonify({"available": False,
+                        "reason": "no unifi block and no Home Assistant API "
+                                  "(run as an add-on with homeassistant_api)"})
 
     @app.post("/api/pull")
     def api_pull() -> Any:
@@ -333,6 +347,7 @@ _PAGE = """<!doctype html>
         <select id="camera"><option value="">— none / unavailable —</option></select>
         <button onclick="loadCameras()">Refresh</button>
       </div>
+      <div id="cameraNote" class="muted"></div>
       <div class="row">
         <div><label>Begin (ISO)</label><input id="start" placeholder="2026-07-04T14:03:00"></div>
         <div><label>End (ISO)</label><input id="end" placeholder="2026-07-04T14:04:30"></div>
@@ -408,15 +423,24 @@ async function runAll(){
 async function loadCameras(){
   const res = await j('api/cameras');
   const sel = document.getElementById('camera');
+  const note = document.getElementById('cameraNote');
   sel.innerHTML = '';
   if(!res.available){
     sel.innerHTML = `<option value="">unavailable: ${res.reason}</option>`;
+    note.textContent = '';
     return;
   }
   for(const cam of res.cameras){
     const o = document.createElement('option');
     o.value = cam.id; o.textContent = cam.name;
     sel.appendChild(o);
+  }
+  if(res.source === 'homeassistant'){
+    note.textContent = `${res.cameras.length} camera(s) from Home Assistant. `
+      + `Recorded-clip pull needs a Protect (unifi) config block — for HA `
+      + `cameras, upload a file or reference an existing clip instead.`;
+  } else {
+    note.textContent = `${res.cameras.length} camera(s) from Unifi Protect.`;
   }
 }
 

@@ -57,10 +57,44 @@ def test_preview_returns_png(client):
     assert r.data[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-def test_cameras_unavailable_without_unifi(client):
+def test_cameras_unavailable_without_unifi(client, monkeypatch):
+    monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+    monkeypatch.delenv("HASSIO_TOKEN", raising=False)
     c, _ = client
     body = c.get("/api/cameras").get_json()
     assert body["available"] is False
+
+
+def test_hass_list_cameras_filters_and_sorts(monkeypatch):
+    from package_watcher.ui import hass
+
+    fake_states = [
+        {"entity_id": "sensor.temperature", "state": "21"},
+        {"entity_id": "camera.front_door",
+         "attributes": {"friendly_name": "Front Door"}, "state": "idle"},
+        {"entity_id": "camera.driveway", "attributes": {}, "state": "recording"},
+    ]
+    monkeypatch.setattr(hass, "_get", lambda path, **kw: fake_states)
+    cams = hass.list_cameras()
+    assert [c["id"] for c in cams] == ["camera.driveway", "camera.front_door"]
+    # falls back to entity_id when friendly_name is absent
+    assert cams[0]["name"] == "camera.driveway"
+    assert cams[1]["name"] == "Front Door"
+
+
+def test_cameras_from_home_assistant(client, monkeypatch):
+    from package_watcher.ui import hass
+
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "test-token")
+    monkeypatch.setattr(hass, "list_cameras",
+                        lambda: [{"id": "camera.porch", "name": "Porch",
+                                  "state": "idle"}])
+    c, _ = client
+    body = c.get("/api/cameras").get_json()
+    assert body["available"] is True
+    assert body["source"] == "homeassistant"
+    assert body["supports_pull"] is False
+    assert body["cameras"][0]["name"] == "Porch"
 
 
 def test_save_new_case_appends_and_preserves(client):
