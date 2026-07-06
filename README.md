@@ -134,6 +134,15 @@ Repositories**, install *Package Watcher*, start it once to generate a
 starter config in the add-on's config folder, edit it, restart. Point
 `sinks.webhook_url` at a HA webhook to drive automations.
 
+The add-on runs the watcher **and** the fixture-authoring UI in one container:
+the UI is exposed through Home Assistant **ingress**, so it shows up as a
+*Package Watcher* item in the sidebar (open the add-on → *Open Web UI*) with no
+extra port to forward or authenticate. The detection service starts
+automatically once you've replaced the placeholder camera in the config;
+until then only the UI comes up, so you can author fixtures right away.
+Fixtures are written to `fixtures_path` (default `/config/fixtures`) in the
+add-on config folder and persist across restarts.
+
 ## Configuration
 
 See [`config.example.yaml`](config.example.yaml) — every knob is commented.
@@ -147,6 +156,55 @@ The ones that matter most:
 | `detector.min/max_area_frac` | 0.0008 / 0.25 | blob size gates |
 | `unifi.attention_seconds` | 120 | attention window after a person trigger |
 
+## Integration tests & the fixture authoring UI
+
+Beyond the unit tests, there is a **data-driven integration suite**: a
+manifest of *fixture cases*, each a clip plus an expectation — "this should
+detect a package" or "this should NOT" — that the detector is graded against.
+A clip is either a real video file (`clips/…`) or a **synthetic, seeded
+scenario** so the suite runs in CI with no committed video.
+
+```bash
+pytest tests/test_fixtures.py         # grade every case
+package-watcher test --fixtures fixtures   # same, human-readable output
+```
+
+```
+PASS package-dropped-on-porch: detected at t=17.5s, region=(0.44, 0.62, 0.14, 0.13), confidence=0.81
+PASS person-walks-through: no detection across 56 samples
+PASS porch-light-switched-on: no detection across 60 samples
+...
+```
+
+Cases live in [`fixtures/cases.yaml`](fixtures/cases.yaml). A `detect` case
+can further require the detection to overlap an expected `region` (normalized
+`x y w h`), fall inside a time window (`after`/`before`), or cap `max_reports`.
+`attention` windows simulate Protect triggers so the triggered code path is
+graded deterministically.
+
+### Authoring fixtures from real footage (the UI)
+
+```bash
+pip install ".[ui,unifi]"
+package-watcher ui --config config.yaml --fixtures fixtures   # http://127.0.0.1:8080
+```
+
+The web UI lets you build fixtures from real cameras without touching YAML:
+
+1. **Grab a clip** — pick a Protect camera and a begin/end time to pull the
+   recorded footage (works for a direct Protect NVR *or* one exposed through
+   Home Assistant — same backend), or upload a local file, or point at an
+   existing clip.
+2. **Label it** — "should detect" / "should NOT", optional expected region and
+   time window.
+3. **Preview** — runs the detector and shows what it found (annotated frame +
+   diff mask) so you can confirm/tune before saving.
+4. **Save** — appends the case to `cases.yaml`; `pytest` grades it thereafter.
+
+"Run all" grades every case inline with pass/fail and the reason:
+
+![fixture UI](docs/ui.png)
+
 ## Development
 
 ```bash
@@ -154,10 +212,11 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The test suite renders synthetic porch footage (noise, lighting drift,
+The unit suite renders synthetic porch footage (noise, lighting drift,
 passersby, package drops) and asserts the detector fires exactly once, at
 the right coordinates, and stays quiet otherwise — including a full
-video-file → service → evidence-bundle end-to-end test.
+video-file → service → evidence-bundle end-to-end test. The integration
+suite (above) grades the detect/no-detect fixture matrix.
 
 ## Roadmap
 

@@ -10,7 +10,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY pyproject.toml README.md config.example.yaml ./
 COPY package_watcher ./package_watcher
-RUN pip install --no-cache-dir ".[unifi]"
+RUN pip install --no-cache-dir ".[unifi,ui]"
 
 COPY package_watcher_addon/run.sh /run.sh
 RUN chmod +x /run.sh
