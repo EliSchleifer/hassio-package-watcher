@@ -45,6 +45,14 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None):
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024  # 512 MB uploads
 
+    def _resolve_unifi():
+        """(UnifiConfig|None, discovered): explicit `unifi` block wins;
+        otherwise try to reuse the HA UniFi Protect integration's creds."""
+        if unifi is not None:
+            return unifi, False
+        from . import hass
+        return hass.discover_unifi_protect(), True
+
     # --- pages ------------------------------------------------------------
     @app.get("/")
     def index() -> Any:
@@ -126,15 +134,19 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None):
     @app.get("/api/cameras")
     def api_cameras() -> Any:
         from . import hass, protect
-        # Prefer a configured Protect NVR: it can pull recorded clips by time
-        # range. Otherwise fall back to discovering camera.* entities straight
-        # from Home Assistant (works out of the box in the add-on, no
-        # credentials), which lists the cameras but can't fetch past footage.
-        if unifi is not None and protect.available():
+        # Prefer a Protect NVR — explicitly configured, or auto-discovered from
+        # the HA UniFi Protect integration — since it can pull recorded clips
+        # by time range. Otherwise fall back to listing camera.* entities from
+        # the HA Core API (no credentials, but no historical footage either).
+        u, discovered = _resolve_unifi()
+        if u is not None:
+            if not protect.available():
+                return jsonify({"available": False,
+                                "reason": "uiprotect not installed"})
             try:
                 return jsonify({"available": True, "source": "protect",
-                                "supports_pull": True,
-                                "cameras": protect.list_cameras(unifi)})
+                                "discovered": discovered, "supports_pull": True,
+                                "cameras": protect.list_cameras(u)})
             except Exception as exc:  # noqa: BLE001
                 return jsonify({"available": False, "reason": str(exc)})
         if hass.available():
@@ -145,17 +157,16 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None):
             except Exception as exc:  # noqa: BLE001
                 return jsonify({"available": False,
                                 "reason": f"Home Assistant API: {exc}"})
-        if unifi is not None and not protect.available():
-            return jsonify({"available": False,
-                            "reason": "uiprotect not installed"})
         return jsonify({"available": False,
-                        "reason": "no unifi block and no Home Assistant API "
+                        "reason": "no unifi block, no discoverable Protect "
+                                  "integration, and no Home Assistant API "
                                   "(run as an add-on with homeassistant_api)"})
 
     @app.post("/api/pull")
     def api_pull() -> Any:
         from . import protect
-        if unifi is None or not protect.available():
+        u, _ = _resolve_unifi()
+        if u is None or not protect.available():
             return jsonify({"error": "Protect not configured"}), 400
         data = request.get_json(force=True)
         try:
@@ -167,7 +178,7 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None):
                            f"{data['camera_id']}-{start:%Y%m%dT%H%M%S}.mp4")
         out = os.path.join(clips_dir, fname)
         try:
-            protect.pull_clip(unifi, data["camera_id"], start, end, out)
+            protect.pull_clip(u, data["camera_id"], start, end, out)
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 500
         return jsonify({"clip": f"clips/{fname}"})
@@ -437,10 +448,11 @@ async function loadCameras(){
   }
   if(res.source === 'homeassistant'){
     note.textContent = `${res.cameras.length} camera(s) from Home Assistant. `
-      + `Recorded-clip pull needs a Protect (unifi) config block — for HA `
-      + `cameras, upload a file or reference an existing clip instead.`;
+      + `Recorded-clip pull needs a Protect NVR — for these cameras, upload a `
+      + `file or reference an existing clip instead.`;
   } else {
-    note.textContent = `${res.cameras.length} camera(s) from Unifi Protect.`;
+    note.textContent = `${res.cameras.length} camera(s) from Unifi Protect`
+      + (res.discovered ? ' (auto-discovered from the HA integration).' : '.');
   }
 }
 

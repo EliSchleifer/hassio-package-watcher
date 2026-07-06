@@ -67,3 +67,64 @@ def list_cameras() -> list[dict[str, Any]]:
             "state": s.get("state"),
         })
     return sorted(cams, key=lambda c: (c["name"] or "").lower())
+
+
+# --- UniFi Protect credential discovery -----------------------------------
+#
+# The Core API deliberately does not expose a config entry's secret `data`, so
+# to reuse the credentials the user already gave the UniFi Protect integration
+# we read HA's on-disk config-entry store. That requires the add-on to mount
+# the HA config directory (map: homeassistant_config). The mount point is
+# /homeassistant on current Supervisor; older setups used /config.
+
+_HA_CONFIG_DIR_CANDIDATES = ("/homeassistant", "/config")
+
+
+def _ha_config_dir() -> Optional[str]:
+    override = os.environ.get("PACKAGE_WATCHER_HA_CONFIG")
+    candidates = (override,) if override else _HA_CONFIG_DIR_CANDIDATES
+    for d in candidates:
+        if d and os.path.isfile(os.path.join(d, ".storage", "core.config_entries")):
+            return d
+    return None
+
+
+def _read_unifiprotect_entry() -> Optional[dict[str, Any]]:
+    """Return the `data` dict of the first unifiprotect config entry, or None."""
+    d = _ha_config_dir()
+    if not d:
+        return None
+    path = os.path.join(d, ".storage", "core.config_entries")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return None
+    entries = (doc.get("data") or {}).get("entries") or []
+    for e in entries:
+        if e.get("domain") == "unifiprotect":
+            data = e.get("data") or {}
+            if data.get("host"):
+                return data
+    return None
+
+
+def discover_unifi_protect():
+    """Build a UnifiConfig from the HA UniFi Protect integration, or None.
+
+    Lets recorded-clip pull work for HA-managed Protect cameras without the
+    user re-entering NVR credentials in the watcher config.
+    """
+    data = _read_unifiprotect_entry()
+    if not data:
+        return None
+    from ..config import UnifiConfig
+
+    return UnifiConfig(
+        host=data["host"],
+        port=int(data.get("port", 443)),
+        username=data.get("username"),
+        password=data.get("password"),
+        api_key=data.get("api_key"),
+        verify_ssl=bool(data.get("verify_ssl", False)),
+    )
