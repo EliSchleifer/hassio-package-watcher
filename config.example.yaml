@@ -1,0 +1,51 @@
+# package-watcher configuration
+#
+# Copy to config.yaml, fill in your camera RTSP URLs, and run:
+#   package-watcher run --config config.yaml
+#
+# Secrets can be pulled from the environment with ${VAR_NAME}.
+
+events_dir: ./events
+
+cameras:
+  # Get the rtsps:// URL from Unifi Protect: camera -> Settings -> Advanced ->
+  # enable an RTSP stream (720p or 1080p is plenty; we downscale anyway).
+  - name: front-door
+    source: rtsps://192.168.1.1:7441/REPLACE_WITH_STREAM_TOKEN?enableSrtp
+    sample_fps: 1.0
+    # Optional detection zone as a normalized polygon (x, y in 0..1).
+    # Restrict to the porch/stoop to ignore the street:
+    # zone:
+    #   - [0.0, 0.45]
+    #   - [1.0, 0.45]
+    #   - [1.0, 1.0]
+    #   - [0.0, 1.0]
+
+detector:
+  resize_width: 640          # processing resolution; lower = less CPU
+  diff_threshold: 18         # grayscale delta counted as "changed"
+  fast_alpha: 0.15           # fast background adapts in ~10 samples
+  slow_alpha: 0.004          # slow background adapts in ~4 minutes @1fps
+  min_area_frac: 0.0008      # ignore blobs smaller than 0.08% of frame
+  max_area_frac: 0.25        # ignore blobs larger than 25% (lighting shifts)
+  persist_samples: 8         # object must stay put ~8s @1fps to report
+  persist_samples_triggered: 4  # lower bar right after a person trigger
+
+# Optional: subscribe to Unifi Protect smart detections as attention triggers.
+# A "person" event opens an attention window during which the detector is
+# more eager to report (a delivery usually follows a person at the door).
+# Requires: pip install package-watcher[unifi]
+# unifi:
+#   host: 192.168.1.1
+#   username: package-watcher     # local Protect user with view permission
+#   password: ${UNIFI_PASSWORD}
+#   verify_ssl: false
+#   trigger_types: [person]
+#   attention_seconds: 120
+#   camera_map:
+#     front-door: "Front Door"    # watcher name -> Protect camera name
+
+sinks:
+  stdout: true
+  jsonl_path: ./events/events.jsonl
+  # webhook_url: http://homeassistant.local:8123/api/webhook/package_watcher

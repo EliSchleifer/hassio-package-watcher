@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "package-watcher"
+version = "0.1.0"
+description = "CPU-only package/new-object detection for fixed Unifi Protect cameras, with evidence output for LLM verification"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+unifi = ["uiprotect>=6.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+package-watcher = "package_watcher.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["package_watcher*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

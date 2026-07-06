@@ -1,0 +1,18 @@
+name: Package Watcher
+version: "0.1.0"
+slug: package_watcher
+description: >-
+  CPU-only package detection for Unifi Protect cameras. Watches RTSP streams
+  with a rolling dual-background model, reports new stationary objects with
+  coordinates and evidence images for LLM verification.
+url: https://github.com/EliSchleifer/hassio-package-watcher
+arch:
+  - amd64
+  - aarch64
+init: false
+map:
+  - addon_config:rw
+options:
+  config_path: /config/config.yaml
+schema:
+  config_path: str
