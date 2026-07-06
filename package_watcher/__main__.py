@@ -44,6 +44,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="fixtures directory to read/write")
     ui.add_argument("--host", default="127.0.0.1")
     ui.add_argument("--port", type=int, default=8080)
+    ui.add_argument("--reload", action="store_true",
+                    help="auto-restart on code edits (dev; needs an editable "
+                         "install) so you can iterate without rebuilding")
     return parser
 
 
@@ -60,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
         from .ui.app import serve
         unifi = load_config(args.config).unifi if args.config else None
         serve(fixtures_dir=args.fixtures, unifi=unifi,
-              host=args.host, port=args.port)
+              host=args.host, port=args.port, reload=args.reload)
         return 0
 
     if args.command == "run":

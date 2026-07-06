@@ -18,7 +18,7 @@ from __future__ import annotations
 import base64
 import io
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Optional
 
 import yaml
@@ -123,7 +123,9 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None):
         frames = result.frames_for_preview
         img = frames.get(kind)
         if img is None:
-            img = frames.get("detection") or frames.get("first")
+            img = frames.get("detection")
+        if img is None:
+            img = frames.get("first")
         if img is None:
             return Response("no preview frame", status=404)
         ok, buf = cv2.imencode(".png", img)
@@ -163,39 +165,32 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None):
                                   "integration, and no Home Assistant API "
                                   "(run as an add-on with homeassistant_api)"})
 
-    @app.post("/api/filmstrip")
-    def api_filmstrip() -> Any:
-        """Cheap scrubbing: N downscaled JPEG snapshots evenly spaced across a
-        window, so the UI can build a Protect-style thumbnail timeline without
-        downloading any video."""
+    @app.get("/api/snapshot")
+    def api_snapshot() -> Any:
+        """One historical frame at a timestamp — drives the scrubber preview.
+        Served as image/jpeg so the browser can load it straight into an
+        <img>, fetched on demand as the user scrubs (no video download)."""
         from . import protect
         u, _ = _resolve_unifi()
         if u is None or not protect.available():
-            return jsonify({"error": "Protect not configured"}), 400
-        data = request.get_json(force=True)
+            return Response("Protect not configured", status=400)
+        camera_id = request.args.get("camera_id")
+        at = request.args.get("at")
+        if not camera_id or not at:
+            return Response("camera_id and at required", status=400)
         try:
-            start = datetime.fromisoformat(data["start"])
-            window_s = float(data.get("window_s", 300))
-            count = int(data.get("count", 16))
-            width = int(data.get("width", 320))
-        except (KeyError, ValueError) as exc:
-            return jsonify({"error": f"bad params: {exc}"}), 400
-        count = max(2, min(count, 40))
-        step = window_s / (count - 1)
-        times = [start + timedelta(seconds=step * i) for i in range(count)]
+            dt = datetime.fromisoformat(at)
+            width = int(request.args.get("width", 640))
+        except ValueError as exc:
+            return Response(f"bad params: {exc}", status=400)
         try:
-            shots = protect.get_snapshots(u, data["camera_id"], times, width=width)
+            data = protect.snapshot_at(u, camera_id, dt, width=width)
         except Exception as exc:  # noqa: BLE001
-            return jsonify({"error": str(exc)}), 500
-        thumbs = [{
-            "i": i,
-            "t_s": round(step * i, 3),
-            "at": t.isoformat(),
-            "jpg": ("data:image/jpeg;base64," + base64.b64encode(s).decode())
-                   if s else None,
-        } for i, (t, s) in enumerate(zip(times, shots))]
-        return jsonify({"start": start.isoformat(), "window_s": window_s,
-                        "count": count, "thumbs": thumbs})
+            return Response(f"snapshot failed: {exc}", status=502)
+        if not data:
+            return Response("no frame at that time", status=404)
+        return Response(data, mimetype="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
 
     @app.post("/api/pull")
     def api_pull() -> Any:
@@ -244,10 +239,61 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None):
             return jsonify({"error": str(exc)}), 500
         return jsonify({"saved": case["name"]})
 
+    @app.post("/api/preview_case")
+    def api_preview_case() -> Any:
+        """Run the detector on an *unsaved* case built from the wizard form, so
+        the user can verify the clip + expectation before committing it."""
+        data = request.get_json(force=True)
+        try:
+            case_dict = _case_from_form(data)
+        except (ValueError, KeyError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        entry = dict(case_dict)
+        if "region" in entry:
+            entry["region"] = tuple(entry["region"])
+        if "zone" in entry:
+            entry["zone"] = [tuple(pt) for pt in entry["zone"]]
+        case = FixtureCase(**entry)
+        try:
+            outcome = run_and_evaluate(case, fixtures_dir, capture_preview=True)
+        except FileNotFoundError as exc:
+            return jsonify({"error": f"clip not found: {exc}"}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 500
+        frames = outcome.result.frames_for_preview
+        det = frames.get("detection")
+        if det is None:
+            det = frames.get("first")
+        return jsonify({
+            "passed": outcome.passed,
+            "reason": outcome.reason,
+            "expect": case.expect,
+            "detections": [
+                {"t": round(d.t, 1),
+                 "bbox": [round(v, 3) for v in d.bbox_norm],
+                 "confidence": round(d.confidence, 3)}
+                for d in outcome.result.detections],
+            "images": {
+                "detection": _png_data_uri(det),
+                "mask": _png_data_uri(frames.get("mask")),
+            },
+        })
+
     return app
 
 
 # --- helpers --------------------------------------------------------------
+
+def _png_data_uri(img) -> Optional[str]:
+    if img is None:
+        return None
+    import cv2
+
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        return None
+    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode()
+
 
 def _safe_name(name: str) -> str:
     keep = "-_.() "
@@ -329,11 +375,14 @@ def _upsert_case(manifest_path: str, case: dict[str, Any]) -> None:
 
 
 def serve(fixtures_dir: str, unifi: Optional[UnifiConfig],
-          host: str, port: int) -> None:
+          host: str, port: int, reload: bool = False) -> None:
     app = create_app(fixtures_dir, unifi)
     print(f"package-watcher UI on http://{host}:{port}  "
-          f"(fixtures: {os.path.abspath(fixtures_dir)})")
-    app.run(host=host, port=port)
+          f"(fixtures: {os.path.abspath(fixtures_dir)})"
+          + ("  [reload]" if reload else ""))
+    # reload=True enables Flask's auto-restart-on-edit for fast local
+    # iteration (edit -> refresh browser); off by default for the add-on.
+    app.run(host=host, port=port, debug=reload, use_reloader=reload)
 
 
 # --- embedded single-page UI ----------------------------------------------
@@ -345,18 +394,18 @@ _PAGE = """<!doctype html>
 <title>package-watcher · fixtures</title>
 <style>
   :root { color-scheme: light dark; --line:#8884; --ok:#2a9d3f; --bad:#d13232;
-          --skip:#9a7b1a; }
+          --skip:#9a7b1a; --accent:#2f6fed; }
   body { font-family: system-ui, sans-serif; margin: 0; line-height: 1.45; }
   header { padding: 12px 20px; border-bottom: 1px solid var(--line);
            display:flex; gap:16px; align-items:center; }
-  header h1 { font-size: 16px; margin: 0; font-weight: 650; }
-  main { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; padding: 20px; }
-  @media (max-width: 900px){ main{ grid-template-columns:1fr; } }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; margin-right:auto; }
+  main { padding: 20px; max-width: 900px; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing:.05em;
        opacity:.7; margin: 0 0 10px; }
   button { font: inherit; padding: 6px 12px; border:1px solid var(--line);
            border-radius: 7px; background: transparent; cursor: pointer; }
-  button.primary { background:#2f6fed; color:#fff; border-color:#2f6fed; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.tab.active { background:var(--line); font-weight:650; }
   table { border-collapse: collapse; width: 100%; font-size: 14px; }
   td, th { text-align:left; padding: 6px 8px; border-bottom:1px solid var(--line); }
   .pill { font-size:12px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); }
@@ -365,17 +414,36 @@ _PAGE = """<!doctype html>
   label { display:block; font-size:13px; margin:8px 0 3px; opacity:.85; }
   input, select, textarea { font: inherit; padding:6px 8px; width:100%;
     box-sizing:border-box; border:1px solid var(--line); border-radius:6px;
-    background:transparent; }
+    background:transparent; color:inherit; }
+  input[type=range]{ padding:0; }
   fieldset { border:1px solid var(--line); border-radius:8px; margin:10px 0; }
-  .row { display:flex; gap:10px; } .row > * { flex:1; }
+  .row { display:flex; gap:10px; align-items:center; } .row > * { flex:1; }
+  .row.tight > * { flex:0 0 auto; }
   img.preview { max-width:100%; border:1px solid var(--line); border-radius:6px;
                 margin-top:8px; }
   .muted { opacity:.6; font-size:12px; }
+  /* wizard modal */
+  .modal { position:fixed; inset:0; background:#0009; display:none;
+           align-items:flex-start; justify-content:center; padding:24px;
+           overflow:auto; z-index:20; }
+  .sheet { background:Canvas; color:CanvasText; width:min(780px,100%);
+           border:1px solid var(--line); border-radius:12px; padding:16px 18px; }
+  .wizhead { display:flex; align-items:center; gap:12px; margin-bottom:6px; }
+  .wizhead b { font-size:15px; }
+  .steps { margin-left:auto; font-size:12px; opacity:.7; }
+  .steps span[data-s].on { color:var(--accent); font-weight:700; opacity:1; }
+  .frame { width:100%; background:#000; border:1px solid var(--line);
+           border-radius:6px; min-height:200px; object-fit:contain; display:block; }
+  .wiznav { display:flex; align-items:center; gap:12px; margin-top:14px;
+            border-top:1px solid var(--line); padding-top:12px; }
+  .wiznav .muted { margin-left:auto; }
+  video { width:100%; border:1px solid var(--line); border-radius:6px; }
 </style></head>
 <body>
 <header>
   <h1>📦 package-watcher fixtures</h1>
-  <button class="primary" onclick="runAll()">Run all</button>
+  <button class="primary" onclick="openWiz()">+ Add a case</button>
+  <button onclick="runAll()">Run all</button>
   <span id="summary" class="muted"></span>
 </header>
 <main>
@@ -384,70 +452,131 @@ _PAGE = """<!doctype html>
     <table id="cases"><tbody></tbody></table>
     <div id="preview"></div>
   </section>
-  <section>
-    <h2>Add a case</h2>
-    <fieldset>
-      <legend>Source</legend>
-      <label>Protect camera — scrub recorded footage &amp; mark in/out</label>
+</main>
+
+<div class="modal" id="modal">
+ <div class="sheet">
+  <div class="wizhead">
+    <b>Add a case</b>
+    <span class="steps">
+      <span data-s="1">1 Source</span> ›
+      <span data-s="2">2 Expectation</span> ›
+      <span data-s="3">3 Verify &amp; save</span>
+    </span>
+    <button onclick="closeWiz()">✕</button>
+  </div>
+
+  <!-- STEP 1: SOURCE -->
+  <div class="wizstep" data-step="1">
+    <div class="row tight" style="gap:6px;margin-bottom:8px">
+      <button class="tab" data-src="scrub" onclick="srcTab('scrub')">Scrub Protect</button>
+      <button class="tab" data-src="upload" onclick="srcTab('upload')">Upload file</button>
+      <button class="tab" data-src="ref" onclick="srcTab('ref')">Reference / synthetic</button>
+    </div>
+
+    <div class="srcpane" data-src="scrub">
       <div class="row">
         <select id="camera"><option value="">— none / unavailable —</option></select>
         <button onclick="loadCameras()">Refresh</button>
       </div>
       <div id="cameraNote" class="muted"></div>
       <div class="row">
-        <div><label>Start</label><input type="datetime-local" id="scrubStart"></div>
-        <div><label>Window</label>
-          <select id="scrubWindow">
+        <div><label>Start</label>
+          <input type="datetime-local" id="scrubStart" onchange="startScrub()"></div>
+        <div><label>Timeline span</label>
+          <select id="scrubWindow" onchange="startScrub()">
             <option value="120">2 min</option>
             <option value="300" selected>5 min</option>
             <option value="600">10 min</option>
             <option value="1800">30 min</option>
           </select></div>
       </div>
-      <button onclick="loadStrip()">Load timeline</button>
-      <div id="strip"></div>
-      <div id="stripSel" class="muted"></div>
-      <div class="row" id="stripActions" style="display:none">
-        <button onclick="zoomSel()">🔍 Zoom to selection</button>
-        <button class="primary" onclick="makeClip()">Pull clip from selection</button>
+      <div id="scrubUI" style="display:none;margin-top:8px">
+        <img id="frame" class="frame" alt="frame at playhead">
+        <div class="muted" id="frameTime" style="text-align:center;margin:4px 0"></div>
+        <input type="range" id="timeline" min="0" max="300" step="1" value="0"
+               oninput="onScrub()">
+        <div class="row tight" style="justify-content:center;gap:6px;margin-top:8px;flex-wrap:wrap">
+          <button onclick="step(-30)">−30s</button>
+          <button onclick="step(-5)">−5s</button>
+          <button onclick="step(-1)">−1s</button>
+          <button onclick="step(1)">+1s</button>
+          <button onclick="step(5)">+5s</button>
+          <button onclick="step(30)">+30s</button>
+          <button onclick="markIn()">⟤ Set In</button>
+          <button onclick="markOut()">Set Out ⟥</button>
+        </div>
+        <div class="muted" id="stripSel" style="text-align:center;margin-top:6px"></div>
+        <div style="text-align:center;margin-top:6px">
+          <button class="primary" onclick="makeClip()">Pull clip from selection</button>
+        </div>
       </div>
-      <label>…or upload a video file</label>
+    </div>
+
+    <div class="srcpane" data-src="upload" style="display:none">
+      <label>Upload a video file</label>
       <input type="file" id="upload" accept="video/*" onchange="uploadClip()">
-      <label>…or reference an existing clip / leave blank for synthetic</label>
-      <input id="clip" placeholder="clips/my-clip.mp4">
-      <label>…or a synthetic scene (JSON)</label>
-      <input id="scene" placeholder='{"scene":"package","hold_s":16}'>
-    </fieldset>
-    <fieldset>
-      <legend>Expectation</legend>
-      <div class="row">
-        <div><label>Name</label><input id="name" placeholder="real-amazon-box"></div>
-        <div><label>Should…</label>
-          <select id="expect">
-            <option value="detect">detect a package</option>
-            <option value="no_detect">NOT detect</option>
-          </select></div>
-      </div>
-      <label>Description</label><input id="description">
-      <div class="row">
-        <div><label>fps</label><input id="fps" value="2.0"></div>
-        <div><label>persist_samples</label><input id="persist" value="6"></div>
-      </div>
-      <label>Expected region (detect only) — x y w h, normalized 0–1</label>
-      <input id="region" placeholder="0.35 0.55 0.30 0.35">
-      <div class="row">
-        <div><label>After (s)</label><input id="after"></div>
-        <div><label>Before (s)</label><input id="before"></div>
-      </div>
-    </fieldset>
-    <button onclick="preview()">Preview detection</button>
-    <button class="primary" onclick="saveCase()">Save case</button>
-    <div id="saveMsg" class="muted"></div>
-  </section>
-</main>
+    </div>
+
+    <div class="srcpane" data-src="ref" style="display:none">
+      <label>Reference an existing clip (relative to the fixtures dir)</label>
+      <input id="clip" placeholder="clips/my-clip.mp4" onchange="refClip()">
+      <label>…or a synthetic scene (JSON) — leave clip blank</label>
+      <input id="scene" placeholder='{"scene":"package","hold_s":16}' oninput="onScene()">
+    </div>
+
+    <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
+    <div id="clipWatch"></div>
+  </div>
+
+  <!-- STEP 2: EXPECTATION -->
+  <div class="wizstep" data-step="2" style="display:none">
+    <div class="row">
+      <div><label>Name</label><input id="name" placeholder="real-amazon-box"></div>
+      <div><label>Should…</label>
+        <select id="expect">
+          <option value="detect">detect a package</option>
+          <option value="no_detect">NOT detect</option>
+        </select></div>
+    </div>
+    <label>Description</label><input id="description">
+    <div class="row">
+      <div><label>fps</label><input id="fps" value="2.0"></div>
+      <div><label>persist_samples</label><input id="persist" value="6"></div>
+    </div>
+    <label>Expected region (detect only) — x y w h, normalized 0–1</label>
+    <input id="region" placeholder="0.35 0.55 0.30 0.35">
+    <div class="row">
+      <div><label>After (s)</label><input id="after"></div>
+      <div><label>Before (s)</label><input id="before"></div>
+    </div>
+  </div>
+
+  <!-- STEP 3: VERIFY & SAVE -->
+  <div class="wizstep" data-step="3" style="display:none">
+    <div class="row" style="justify-content:space-between">
+      <div class="muted">Runs the detector on this clip + expectation so you can
+        confirm it grades the way you intend before saving.</div>
+      <button onclick="verify()">↻ Re-run</button>
+    </div>
+    <div id="verifyOut" style="margin-top:8px"></div>
+  </div>
+
+  <div class="wiznav">
+    <button id="btnBack" onclick="wizBack()">Back</button>
+    <button id="btnNext" class="primary" onclick="wizNext()">Next</button>
+    <button id="btnSave" class="primary" onclick="saveCase()" style="display:none">Save case</button>
+    <span id="wizMsg" class="muted"></span>
+  </div>
+ </div>
+</div>
+
 <script>
 async function j(url, opts){ const r = await fetch(url, opts); return r.json(); }
+function msg(id, text){ document.getElementById(id).textContent = text; }
+function wizMsg(t){ msg('wizMsg', t); }
 
+// ---- case list + run all --------------------------------------------------
 async function loadCases(){
   const cases = await j('api/cases');
   const tb = document.querySelector('#cases tbody');
@@ -465,7 +594,7 @@ async function loadCases(){
 function cssId(s){ return s.replace(/[^a-z0-9]/gi,'_'); }
 
 async function runAll(){
-  document.getElementById('summary').textContent = 'running…';
+  msg('summary','running…');
   const res = await j('api/run', {method:'POST'});
   let pass=0, fail=0, skip=0;
   for(const r of res){
@@ -474,10 +603,53 @@ async function runAll(){
       <div class="reason">${r.reason||''}</div>`; }
     if(r.status==='pass')pass++; else if(r.status==='fail')fail++; else skip++;
   }
-  document.getElementById('summary').textContent =
-    `${pass} passed, ${fail} failed, ${skip} skipped`;
+  msg('summary', `${pass} passed, ${fail} failed, ${skip} skipped`);
 }
 
+async function preview(name){
+  const div = document.getElementById('preview');
+  const bust = 't=' + Date.now();
+  const url = k => `api/preview/${encodeURIComponent(name)}.png?${bust}&kind=${k}`;
+  div.innerHTML = `<h2>Preview: ${name}</h2>
+    <div class="row" style="align-items:flex-start">
+      <div><div class="muted">detection</div><img class="preview" src="${url('detection')}"></div>
+      <div><div class="muted">diff mask</div><img class="preview" src="${url('mask')}"></div>
+    </div>
+    <div class="muted">Full frame with no box means nothing was detected.</div>`;
+}
+
+// ---- wizard shell ---------------------------------------------------------
+let wiz = { clip:null };
+let step = 1;
+function openWiz(){ step=1; if(document.getElementById('camera').options.length<=1) loadCameras(); showStep(); document.getElementById('modal').style.display='flex'; }
+function closeWiz(){ document.getElementById('modal').style.display='none'; }
+function showStep(){
+  document.querySelectorAll('.wizstep').forEach(el =>
+    el.style.display = (+el.dataset.step===step) ? '' : 'none');
+  document.querySelectorAll('.steps span[data-s]').forEach(s =>
+    s.classList.toggle('on', +s.dataset.s===step));
+  document.getElementById('btnBack').style.visibility = step>1 ? 'visible' : 'hidden';
+  document.getElementById('btnNext').style.display = step<3 ? '' : 'none';
+  document.getElementById('btnSave').style.display = step===3 ? '' : 'none';
+  wizMsg('');
+  if(step===3) verify();
+}
+function wizBack(){ if(step>1){ step--; showStep(); } }
+function wizNext(){
+  if(step===1 && !wiz.clip && !sceneVal()){
+    wizMsg('pull, upload, or reference a clip first (or enter a synthetic scene)'); return; }
+  if(step===2 && !document.getElementById('name').value.trim()){
+    wizMsg('give the case a name'); return; }
+  if(step<3){ step++; showStep(); }
+}
+function srcTab(which){
+  document.querySelectorAll('.srcpane').forEach(p =>
+    p.style.display = (p.dataset.src===which) ? '' : 'none');
+  document.querySelectorAll('.tab').forEach(b =>
+    b.classList.toggle('active', b.dataset.src===which));
+}
+
+// ---- source: cameras ------------------------------------------------------
 async function loadCameras(){
   const res = await j('api/cameras');
   const sel = document.getElementById('camera');
@@ -485,129 +657,112 @@ async function loadCameras(){
   sel.innerHTML = '';
   if(!res.available){
     sel.innerHTML = `<option value="">unavailable: ${res.reason}</option>`;
-    note.textContent = '';
-    return;
+    note.textContent = ''; return;
   }
   for(const cam of res.cameras){
     const o = document.createElement('option');
-    o.value = cam.id; o.textContent = cam.name;
-    sel.appendChild(o);
+    o.value = cam.id; o.textContent = cam.name; sel.appendChild(o);
   }
-  if(res.source === 'homeassistant'){
-    note.textContent = `${res.cameras.length} camera(s) from Home Assistant. `
-      + `Recorded-clip pull needs a Protect NVR — for these cameras, upload a `
-      + `file or reference an existing clip instead.`;
-  } else {
-    note.textContent = `${res.cameras.length} camera(s) from Unifi Protect`
-      + (res.discovered ? ' (auto-discovered from the HA integration).' : '.');
-  }
+  note.textContent = (res.source === 'homeassistant')
+    ? `${res.cameras.length} camera(s) from Home Assistant. Recorded-clip scrub needs a Protect NVR — for these, upload or reference a clip.`
+    : `${res.cameras.length} camera(s) from Unifi Protect${res.discovered ? ' (auto-discovered from the HA integration).' : '.'}`;
 }
 
-// --- Protect scrubbing: cheap thumbnail timeline, mark in/out, pull only
-// the selected range as video. No full-window download.
-let strip = null, inAt = null, outAt = null;
-
-async function loadStrip(){
+// ---- source: Protect scrubber (preview + timeline, frames fetched async) --
+let scrub = null, seekTimer = null;
+function startScrub(){
   const cam = document.getElementById('camera').value;
   const startLocal = document.getElementById('scrubStart').value;
-  const win = parseFloat(document.getElementById('scrubWindow').value);
-  if(!cam){ msg('saveMsg','pick a camera'); return; }
-  if(!startLocal){ msg('saveMsg','set a start time'); return; }
-  // datetime-local is naive local time; send absolute UTC so the NVR agrees.
-  await fetchStrip(cam, new Date(startLocal).toISOString(), win);
+  if(!cam){ wizMsg('pick a camera'); return; }
+  if(!startLocal){ return; }
+  const startMs = new Date(startLocal).getTime();
+  const windowS = parseFloat(document.getElementById('scrubWindow').value);
+  scrub = { cam, startMs, windowS, inS:null, outS:null };
+  const tl = document.getElementById('timeline');
+  tl.min = 0; tl.max = windowS; tl.step = 1; tl.value = 0;
+  document.getElementById('scrubUI').style.display = '';
+  updSel(); seek(0);
 }
-
-async function fetchStrip(cam, startUtc, win){
-  msg('saveMsg','loading timeline…');
-  const res = await j('api/filmstrip', {method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({camera_id: cam, start: startUtc, window_s: win,
-                          count: 16, width: 320})});
-  if(res.error){ msg('saveMsg','timeline failed: '+res.error); return; }
-  strip = Object.assign({cam}, res); inAt = null; outAt = null;
-  renderStrip(); msg('saveMsg','timeline loaded — click a frame for In, another for Out');
+function atIso(off){ return new Date(scrub.startMs + off*1000).toISOString(); }
+function curOff(){ return parseFloat(document.getElementById('timeline').value); }
+function fmtClock(off){ return new Date(scrub.startMs + off*1000).toLocaleTimeString(); }
+function onScrub(){
+  const off = curOff();
+  document.getElementById('frameTime').textContent = fmtClock(off);
+  if(seekTimer) clearTimeout(seekTimer);
+  seekTimer = setTimeout(() => { seekTimer = null; seek(off); }, 120);  // async, latest wins
 }
-
-function renderStrip(){
-  const el = document.getElementById('strip'); el.innerHTML = '';
-  const row = document.createElement('div');
-  row.style.cssText = 'display:flex;gap:2px;overflow-x:auto;padding:8px 0';
-  for(const t of strip.thumbs){
-    const cell = document.createElement('div');
-    cell.style.cssText = 'flex:0 0 auto;text-align:center;cursor:pointer';
-    cell.dataset.at = t.at;
-    cell.innerHTML = (t.jpg
-        ? `<img src="${t.jpg}" style="height:96px;display:block;border:3px solid transparent;border-radius:4px">`
-        : `<div style="height:96px;width:128px;background:var(--line);border-radius:4px"></div>`)
-      + `<div class="muted" style="font-size:10px">${new Date(t.at).toLocaleTimeString()}</div>`;
-    cell.onclick = () => pickThumb(t.at);
-    row.appendChild(cell);
-  }
-  el.appendChild(row);
-  document.getElementById('stripActions').style.display = 'flex';
-  highlight(); updateStripSel();
+function seek(off){
+  const img = document.getElementById('frame');
+  img.src = `api/snapshot?camera_id=${encodeURIComponent(scrub.cam)}&at=${encodeURIComponent(atIso(off))}&width=640`;
+  document.getElementById('frameTime').textContent = fmtClock(off);
 }
-
-function pickThumb(at){
-  if(inAt === null || (inAt !== null && outAt !== null)){ inAt = at; outAt = null; }
-  else if(new Date(at) < new Date(inAt)){ outAt = inAt; inAt = at; }
-  else { outAt = at; }
-  highlight(); updateStripSel();
+function step(d){
+  if(!scrub) return;
+  const tl = document.getElementById('timeline');
+  let v = Math.max(0, curOff() + d);
+  if(v > parseFloat(tl.max)) tl.max = v;   // allow scrubbing past the initial span
+  tl.value = v; seek(v);
 }
-
-function highlight(){
-  document.querySelectorAll('#strip [data-at]').forEach(cell => {
-    const at = cell.dataset.at, img = cell.querySelector('img'); if(!img) return;
-    let c = 'transparent';
-    if(at === inAt) c = 'var(--ok)';
-    else if(at === outAt) c = 'var(--bad)';
-    else if(inAt && outAt && new Date(at) > new Date(inAt) && new Date(at) < new Date(outAt)) c = '#2f6fed';
-    img.style.borderColor = c;
-  });
+function markIn(){ if(!scrub) return; scrub.inS = curOff(); if(scrub.outS!=null && scrub.outS<=scrub.inS) scrub.outS=null; updSel(); }
+function markOut(){ if(!scrub) return; scrub.outS = curOff(); if(scrub.inS!=null && scrub.outS<=scrub.inS) scrub.inS=null; updSel(); }
+function updSel(){
+  const f = s => s==null ? '—' : new Date(scrub.startMs + s*1000).toLocaleTimeString();
+  let t = `in ${f(scrub && scrub.inS)} · out ${f(scrub && scrub.outS)}`;
+  if(scrub && scrub.inS!=null && scrub.outS!=null) t += ` · length ${Math.round(scrub.outS-scrub.inS)}s`;
+  document.getElementById('stripSel').textContent = t;
 }
-
-function updateStripSel(){
-  const f = iso => iso ? new Date(iso).toLocaleTimeString() : '—';
-  let s = `in ${f(inAt)} · out ${f(outAt)}`;
-  if(inAt && outAt) s += ` · length ${Math.round((new Date(outAt)-new Date(inAt))/1000)}s`;
-  document.getElementById('stripSel').textContent = s;
-}
-
-function zoomSel(){
-  if(!inAt || !outAt){ msg('saveMsg','click an In frame and an Out frame first'); return; }
-  const win = (new Date(outAt) - new Date(inAt)) / 1000;
-  fetchStrip(strip.cam, inAt, Math.max(20, win));  // refetch finer thumbs in-range
-}
-
 async function makeClip(){
-  if(!inAt || !outAt){ msg('saveMsg','click an In frame and an Out frame first'); return; }
-  msg('saveMsg','pulling selected clip from Protect…');
-  const res = await j('api/pull', {method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({camera_id: strip.cam, start: inAt, end: outAt})});
-  if(res.error){ msg('saveMsg','pull failed: '+res.error); return; }
-  document.getElementById('clip').value = res.clip;
-  msg('saveMsg','clip ready: '+res.clip+' — now name it and Save case');
+  if(!scrub || scrub.inS==null || scrub.outS==null){ wizMsg('set In and Out first'); return; }
+  wizMsg('pulling selected clip from Protect…');
+  const res = await j('api/pull', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({camera_id: scrub.cam, start: atIso(scrub.inS), end: atIso(scrub.outS)})});
+  if(res.error){ wizMsg('pull failed: '+res.error); return; }
+  setClip(res.clip); wizMsg('clip ready — watch it below to confirm, then Next');
 }
 
+// ---- source: upload / reference / synthetic -------------------------------
 async function uploadClip(){
   const f = document.getElementById('upload').files[0];
   if(!f) return;
+  wizMsg('uploading…');
   const fd = new FormData(); fd.append('file', f);
   const res = await j('api/upload', {method:'POST', body: fd});
-  if(res.error){ msg('saveMsg', res.error); return; }
-  document.getElementById('clip').value = res.clip;
-  msg('saveMsg','uploaded '+res.clip);
+  if(res.error){ wizMsg(res.error); return; }
+  setClip(res.clip); wizMsg('uploaded — watch it below to confirm, then Next');
+}
+function refClip(){ const v = document.getElementById('clip').value.trim(); if(v) setClip(v); }
+function onScene(){ wiz.clip = null; renderWatch(); }
+function sceneVal(){ return document.getElementById('scene').value.trim(); }
+
+function setClip(path){
+  wiz.clip = path;
+  document.getElementById('clip').value = path;
+  document.getElementById('scene').value = '';
+  renderWatch();
+}
+function renderWatch(){
+  const el = document.getElementById('clipWatch');
+  if(wiz.clip){
+    el.innerHTML = `<div class="muted">Source clip — watch to confirm it's the right footage:</div>
+      <video controls preload="metadata" src="${encodeURI(wiz.clip)}"></video>
+      <div class="muted">${wiz.clip}</div>`;
+  } else if(sceneVal()){
+    el.innerHTML = `<div class="muted">Synthetic scene — nothing to watch; verify on step 3.</div>`;
+  } else {
+    el.innerHTML = `<div class="muted">No source chosen yet.</div>`;
+  }
 }
 
+// ---- expectation + verify + save ------------------------------------------
 function formCase(){
   const region = document.getElementById('region').value.trim();
-  const scene = document.getElementById('scene').value.trim();
-  const c = {
+  const scene = sceneVal();
+  return {
     name: document.getElementById('name').value,
     expect: document.getElementById('expect').value,
     description: document.getElementById('description').value,
-    clip: document.getElementById('clip').value || null,
+    clip: (wiz.clip || document.getElementById('clip').value) || null,
     scene: scene ? JSON.parse(scene) : null,
     fps: parseFloat(document.getElementById('fps').value||'2'),
     detector: { persist_samples: parseInt(document.getElementById('persist').value||'6') },
@@ -615,38 +770,40 @@ function formCase(){
     after: document.getElementById('after').value || null,
     before: document.getElementById('before').value || null,
   };
-  return c;
+}
+
+async function verify(){
+  const box = document.getElementById('verifyOut');
+  box.innerHTML = '<div class="muted">running detector…</div>';
+  let res;
+  try { res = await j('api/preview_case', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(formCase())}); }
+  catch(e){ box.innerHTML = `<div class="fail">error: ${e}</div>`; return; }
+  if(res.error){ box.innerHTML = `<div class="fail">error: ${res.error}</div>`; return; }
+  const cls = res.passed ? 'pass' : 'fail';
+  const mark = res.passed ? '✓ grades as you expect' : '✗ does NOT grade as expected';
+  const dets = (res.detections||[]).map(d =>
+    `t=${d.t}s · region=(${d.bbox.join(', ')}) · conf=${d.confidence}`).join('<br>') || 'none';
+  box.innerHTML = `<div class="${cls}"><b>${mark}</b> — ${res.reason}</div>
+    <div class="row" style="align-items:flex-start;margin-top:8px">
+      <div><div class="muted">detection</div>${res.images.detection?`<img class="preview" src="${res.images.detection}">`:'<div class="muted">—</div>'}</div>
+      <div><div class="muted">diff mask</div>${res.images.mask?`<img class="preview" src="${res.images.mask}">`:'<div class="muted">—</div>'}</div>
+    </div>
+    <div class="muted" style="margin-top:6px">detections: ${dets}</div>`;
 }
 
 async function saveCase(){
+  wizMsg('saving…');
   const res = await j('api/save_case', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(formCase())});
-  if(res.error){ msg('saveMsg','save failed: '+res.error); return; }
-  msg('saveMsg','saved '+res.saved);
-  loadCases();
+  if(res.error){ wizMsg('save failed: '+res.error); return; }
+  wizMsg('saved '+res.saved);
+  await loadCases();
+  closeWiz();
 }
 
-async function preview(name){
-  // If a name is given, preview that saved case. Otherwise save-then-preview
-  // is overkill; previewing a saved case is the common path.
-  const target = name || document.getElementById('name').value;
-  if(!target){ msg('saveMsg','name a case (or click preview on a row)'); return; }
-  const div = document.getElementById('preview');
-  const bust = 't=' + Date.now();
-  const url = k => `api/preview/${encodeURIComponent(target)}.png?${bust}&kind=${k}`;
-  div.innerHTML = `<h2>Preview: ${target}</h2>
-    <div class="row">
-      <div><div class="muted">detection</div>
-        <img class="preview" src="${url('detection')}"></div>
-      <div><div class="muted">diff mask</div>
-        <img class="preview" src="${url('mask')}"></div>
-    </div>
-    <div class="muted">If the detection image shows the full frame with no box,
-      nothing was detected for this case.</div>`;
-}
-
-function msg(id, text){ document.getElementById(id).textContent = text; }
-loadCases(); loadCameras();
+srcTab('scrub');
+loadCases();
 </script>
 </body></html>
 """
