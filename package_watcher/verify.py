@@ -73,6 +73,8 @@ class FlorenceVerifier:
         self.cfg = cfg
         self._model = None
         self._processor = None
+        self._sam = None
+        self._sam_processor = None
         self._lock = threading.Lock()
 
     # -- model plumbing --------------------------------------------------
@@ -131,17 +133,67 @@ class FlorenceVerifier:
     # vocabulary instead; a true instruction-following VLM backend (Ollama /
     # Claude) is the upgrade path if caption words ever stop being enough.
 
+    def _mask_bbox(self, frame_bgr: np.ndarray,
+                   bbox: tuple[int, int, int, int]
+                   ) -> Optional[tuple[int, int, int, int]]:
+        """SAM 2 crop refinement: prompt the segmenter with the loose diff
+        bbox, return the actual object boundary's bbox. None on any failure
+        (missing deps, empty mask) — the plain crop is always a safe
+        fallback. Overridable in tests."""
+        try:
+            import torch
+            from PIL import Image
+            from transformers import Sam2Model, Sam2Processor
+
+            with self._lock:
+                if self._sam is None:
+                    kwargs = ({"cache_dir": self.cfg.cache_dir}
+                              if self.cfg.cache_dir else {})
+                    self._sam_processor = Sam2Processor.from_pretrained(
+                        self.cfg.refine_model, **kwargs)
+                    self._sam = Sam2Model.from_pretrained(
+                        self.cfg.refine_model, **kwargs).eval()
+            x, y, w, h = bbox
+            image = Image.fromarray(frame_bgr[:, :, ::-1])
+            inputs = self._sam_processor(
+                images=image, input_boxes=[[[x, y, x + w, y + h]]],
+                return_tensors="pt")
+            with torch.no_grad():
+                out = self._sam(**inputs, multimask_output=False)
+            mask = self._sam_processor.post_process_masks(
+                out.pred_masks, inputs["original_sizes"])[0][0, 0]
+            mask = mask.numpy().astype(bool)
+            if not mask.any():
+                return None
+            ys, xs = np.nonzero(mask)
+            return (int(xs.min()), int(ys.min()),
+                    int(xs.max() - xs.min()), int(ys.max() - ys.min()))
+        except Exception as exc:  # noqa: BLE001 - refinement is optional
+            log.debug("sam2 refinement unavailable: %s", exc)
+            return None
+
     # -- public API -------------------------------------------------------
     def verify(self, frame_bgr: np.ndarray,
                bbox: tuple[int, int, int, int]) -> dict[str, Any]:
-        """Caption the (margined) crop and decide whether it's a delivery."""
-        crop = crop_with_margin(frame_bgr, bbox, self.cfg.crop_margin)
+        """Caption the (margined) crop and decide whether it's a delivery.
+
+        With refine=sam2 the crop is fitted to the segmented object boundary
+        first — measured on real footage this yields cleaner captions (the
+        real background stays in frame; removing it made Florence read
+        objects as '3D renderings')."""
+        refined = None
+        if self.cfg.refine == "sam2":
+            refined = self._mask_bbox(frame_bgr, bbox)
+        crop = (crop_with_margin(frame_bgr, refined, 0.2)
+                if refined else
+                crop_with_margin(frame_bgr, bbox, self.cfg.crop_margin))
         if crop.size == 0:
             return {"accepted": False, "label": "other", "caption": ""}
         caption = self._caption(crop)
         verdict = decide(caption, self.cfg.accept)
         verdict["backend"] = "florence"
         verdict["model"] = self.cfg.model
+        verdict["refined"] = refined is not None
         return verdict
 
 

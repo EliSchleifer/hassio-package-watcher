@@ -77,6 +77,13 @@ class VerifierConfig:
         "package", "box", "parcel", "carton", "envelope", "crate", "mailer",
         "bag"])
     crop_margin: float = 0.35        # context margin around the bbox crop
+    # Crop refinement with SAM 2: the diff blob's bbox is loose, so prompt a
+    # segmenter with it and crop to the actual object boundary before
+    # captioning. Measured on real footage: cleaner captions, no regressions.
+    # (Background *removal* was also tried and made things worse — Florence
+    # reads isolated objects as "3D renderings".) "off" disables.
+    refine: str = "sam2"
+    refine_model: str = "facebook/sam2.1-hiera-tiny"
     suppress_rejected: bool = False  # drop events whose crop isn't accepted
 
 
