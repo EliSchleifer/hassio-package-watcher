@@ -677,7 +677,8 @@ _PAGE = """<!doctype html>
     <div class="row" style="margin-top:8px">
       <div><label>Camera</label>
         <select id="btCam"><option value="">— none —</option></select></div>
-      <div><label>Day</label><input type="date" id="btDate"></div>
+      <div><label>Day</label><input type="date" id="btDate" autocomplete="off"
+        data-form-type="other" data-lpignore="true" data-1p-ignore></div>
       <div><label>Every</label>
         <select id="btInt">
           <option value="300">5 min</option>
@@ -726,7 +727,9 @@ _PAGE = """<!doctype html>
       <div id="cameraNote" class="muted"></div>
       <div class="row">
         <div><label>Start</label>
-          <input type="datetime-local" id="scrubStart" onchange="startScrub()"></div>
+          <input type="datetime-local" id="scrubStart" onchange="startScrub()"
+            autocomplete="off" data-form-type="other" data-lpignore="true"
+            data-1p-ignore></div>
         <div><label>Timeline span</label>
           <select id="scrubWindow" onchange="startScrub()">
             <option value="120">2 min</option>
