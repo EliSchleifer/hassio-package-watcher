@@ -22,6 +22,10 @@ cameras:
     #   - [0.0, 1.0]
 
 detector:
+  # mode: person_gated       # compare clean scenes bracketing a person's
+                             # visit (needs the unifi block for the person
+                             # signal); people can't false-positive. Default
+                             # "background" watches continuously.
   resize_width: 640          # processing resolution; lower = less CPU
   diff_threshold: 18         # grayscale delta counted as "changed"
   fast_alpha: 0.15           # fast background adapts in ~10 samples
@@ -30,6 +34,13 @@ detector:
   max_area_frac: 0.25        # ignore blobs larger than 25% (lighting shifts)
   persist_samples: 8         # object must stay put ~8s @1fps to report
   persist_samples_triggered: 4  # lower bar right after a person trigger
+
+# Optional second stage: Florence-2 (local, CPU) captions each candidate crop
+# and decides package vs noise. Requires: pip install package-watcher[verify]
+# verifier:
+#   backend: florence
+#   accept: [package, box, parcel, carton, envelope, crate]
+#   suppress_rejected: true  # drop events the model rejects
 
 # Optional: subscribe to Unifi Protect smart detections as attention triggers.
 # A "person" event opens an attention window during which the detector is
