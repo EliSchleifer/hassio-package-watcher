@@ -184,10 +184,12 @@ The ones that matter most:
 ## Integration tests & the fixture authoring UI
 
 Beyond the unit tests, there is a **data-driven integration suite**: a
-manifest of *fixture cases*, each a clip plus an expectation — "this should
-detect a package" or "this should NOT" — that the detector is graded against.
-A clip is either a real video file (`clips/…`) or a **synthetic, seeded
-scenario** so the suite runs in CI with no committed video.
+manifest of *fixture cases*, each a **real clip** plus an expectation —
+"this should detect a package" or "this should NOT" — that the detector is
+graded against. Clips are real footage and stay **local**
+(`fixtures/clips/` is gitignored — footage is private); a case whose clip
+isn't on this machine is skipped, not failed, so the manifest is shareable
+without sharing the video.
 
 ```bash
 pytest tests/test_fixtures.py         # grade every case
@@ -195,17 +197,17 @@ package-watcher test --fixtures fixtures   # same, human-readable output
 ```
 
 ```
-PASS package-dropped-on-porch: detected at t=17.5s, region=(0.44, 0.62, 0.14, 0.13), confidence=0.81
-PASS person-walks-through: no detection across 56 samples
-PASS porch-light-switched-on: no detection across 60 samples
+PASS box: detected at t=158.0s, region=(0.42, 0.83, 0.10, 0.17), confidence=0.82
+SKIP front-walkway-no-package: clip not present (clips/front-walkway.mp4)
 ...
 ```
 
 Cases live in [`fixtures/cases.yaml`](fixtures/cases.yaml). A `detect` case
 can further require the detection to overlap an expected `region` (normalized
 `x y w h`), fall inside a time window (`after`/`before`), or cap `max_reports`.
-`attention` windows simulate Protect triggers so the triggered code path is
-graded deterministically.
+`presence` windows carry when a person was in frame (auto-imported from
+Protect) for `mode: person_gated`; `attention` windows simulate triggers for
+the background mode.
 
 ### Authoring fixtures from real footage (the UI)
 
@@ -223,8 +225,7 @@ real footage without touching YAML:
      appears immediately and a **timeline** lets you scrub (frames are fetched
      on demand as JPEG snapshots — no video download) with ±1/±5/±30s stepping.
      Mark **In** and **Out**, then pull just that short range as the clip.
-   - *Upload* a local video file, or *Reference* an existing clip / a synthetic
-     scene.
+   - *Upload* a local video file, or *Reference* an existing clip.
 
    When running as the Home Assistant add-on, the camera list is populated
    automatically from your HA `camera.*` entities, and Protect NVR credentials
@@ -238,6 +239,9 @@ real footage without touching YAML:
    appends the case to `cases.yaml` and keeps the clip for future
    training/validation; `pytest` grades it thereafter.
 
+Saved cases can be **reopened from the list** ("open") — watch the clip, see
+the drawn region overlaid on the video, tweak any field, and re-save.
+
 "Run all" grades every case inline with pass/fail and the reason:
 
 ![fixture UI](docs/ui.png)
@@ -249,11 +253,11 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The unit suite renders synthetic porch footage (noise, lighting drift,
-passersby, package drops) and asserts the detector fires exactly once, at
-the right coordinates, and stays quiet otherwise — including a full
-video-file → service → evidence-bundle end-to-end test. The integration
-suite (above) grades the detect/no-detect fixture matrix.
+The unit suite tests the detector's invariants on generated frames (fires
+exactly once, at the right coordinates, stays quiet on noise/drift/motion)
+and exercises the full video-file → service → evidence-bundle pipeline on
+tiny generated mp4s. **Detection quality is graded only against real
+footage** — the fixture suite above, authored from your own cameras.
 
 ## Roadmap
 

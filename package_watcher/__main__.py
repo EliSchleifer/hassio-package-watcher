@@ -57,8 +57,8 @@ def _setup_unifi(path: str) -> None:
     """Interactively write a UniFi Protect `unifi:` config for the UI.
 
     Credentials are typed into the local terminal and written straight to the
-    file — nothing is echoed back. Leave the host blank to skip (you can still
-    upload clips / use synthetic scenes).
+    file — nothing is echoed back. Leave the host blank to skip (you can
+    still upload clips).
     """
     import getpass
 
