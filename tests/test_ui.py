@@ -129,6 +129,23 @@ def test_discover_unifi_protect_absent(tmp_path, monkeypatch):
     assert hass.discover_unifi_protect() is None
 
 
+def test_page_js_parses(tmp_path):
+    """A syntax error in the embedded JS breaks the whole page silently
+    (buttons do nothing). If node is available, syntax-check the script."""
+    import shutil, subprocess, re
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available to syntax-check page JS")
+    from package_watcher.ui.app import create_app
+    (tmp_path / "cases.yaml").write_text("cases: []\n")
+    html = create_app(str(tmp_path)).test_client().get("/").get_data(as_text=True)
+    js = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+    (tmp_path / "page.js").write_text(js)
+    r = subprocess.run([node, "--check", str(tmp_path / "page.js")],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
 def test_load_config_unifi_only():
     import tempfile, os
     from package_watcher.config import load_config

@@ -513,12 +513,12 @@ _PAGE = """<!doctype html>
         <input type="range" id="timeline" min="0" max="300" step="1" value="0"
                oninput="onScrub()">
         <div class="row tight" style="justify-content:center;gap:6px;margin-top:8px;flex-wrap:wrap">
-          <button onclick="step(-30)">−30s</button>
-          <button onclick="step(-5)">−5s</button>
-          <button onclick="step(-1)">−1s</button>
-          <button onclick="step(1)">+1s</button>
-          <button onclick="step(5)">+5s</button>
-          <button onclick="step(30)">+30s</button>
+          <button onclick="nudge(-30)">−30s</button>
+          <button onclick="nudge(-5)">−5s</button>
+          <button onclick="nudge(-1)">−1s</button>
+          <button onclick="nudge(1)">+1s</button>
+          <button onclick="nudge(5)">+5s</button>
+          <button onclick="nudge(30)">+30s</button>
           <button onclick="markIn()">⟤ Set In</button>
           <button onclick="markOut()">Set Out ⟥</button>
         </div>
@@ -713,7 +713,7 @@ function seek(off){
   img.src = `api/snapshot?camera_id=${encodeURIComponent(scrub.cam)}&at=${encodeURIComponent(atIso(off))}&width=640`;
   document.getElementById('frameTime').textContent = fmtClock(off);
 }
-function step(d){
+function nudge(d){
   if(!scrub) return;
   const tl = document.getElementById('timeline');
   let v = Math.max(0, curOff() + d);
