@@ -97,7 +97,8 @@ class _Session:
         return client
 
     def snapshot(self, cfg: UnifiConfig, camera_id: str,
-                 dt: Optional[datetime], width: int) -> Optional[bytes]:
+                 dt: Optional[datetime],
+                 width: Optional[int]) -> Optional[bytes]:
         with self._lock:
             loop = self._ensure_loop()
 
@@ -121,10 +122,14 @@ _session = _Session()
 
 
 def snapshot_at(cfg: UnifiConfig, camera_id: str, dt: Optional[datetime],
-                width: int = 640) -> Optional[bytes]:
-    """One frame at ``dt`` (or the LIVE view when dt is None) — fast enough
-    to drive a scrubber. Recorded footage at "now" does not exist yet on the
-    NVR, so callers wanting the current view must pass None."""
+                width: Optional[int] = 640) -> Optional[bytes]:
+    """One frame at ``dt`` (or the LIVE view when dt is None).
+
+    width=640 keeps interactive scrubbing snappy; pass width=None for the
+    camera's native resolution — detection/verification paths should, since
+    they are cron-cadence work where quality beats latency. Recorded footage
+    at "now" does not exist yet on the NVR, so callers wanting the current
+    view must pass dt=None."""
     return _session.snapshot(cfg, camera_id, dt, width)
 
 
