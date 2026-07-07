@@ -26,7 +26,7 @@ from typing import Any, Optional
 import yaml
 
 from ..config import UnifiConfig
-from ..harness import FixtureCase, load_cases, run_and_evaluate, run_case
+from ..harness import FixtureCase, load_cases, run_and_evaluate
 
 
 def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
@@ -140,15 +140,32 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
         if case is None:
             return Response("no such case", status=404)
         kind = request.args.get("kind", "detection")
-        result = run_case(case, fixtures_dir, capture_preview=True)
-        frames = result.frames_for_preview
-        img = frames.get(kind)
+        # Evaluate (not just run) so this shows the SAME detection the grade
+        # was based on — the one matching the expected region — keeping the
+        # case-list preview consistent with the wizard's verify view.
+        outcome = run_and_evaluate(case, fixtures_dir, capture_preview=True)
+        res = outcome.result
+        frames = res.frames_for_preview
+        mi = outcome.matched_index
+        img = None
+        if mi is not None and mi < len(res.det_frames):
+            img = {"detection": res.det_frames[mi],
+                   "mask": res.det_masks[mi]}.get(kind)
+        if img is None:
+            img = frames.get(kind)
         if img is None:
             img = frames.get("detection")
         if img is None:
             img = frames.get("first")
         if img is None:
             return Response("no preview frame", status=404)
+        if kind == "detection" and case.region is not None:
+            img = img.copy()
+            dh, dw = img.shape[:2]
+            rx, ry, rw, rh = case.region
+            cv2.rectangle(img, (int(rx * dw), int(ry * dh)),
+                          (int((rx + rw) * dw), int((ry + rh) * dh)),
+                          (255, 200, 0), 2)
         ok, buf = cv2.imencode(".png", img)
         if not ok:
             return Response("encode failed", status=500)
