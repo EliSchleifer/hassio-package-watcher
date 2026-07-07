@@ -138,6 +138,7 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
                 "detector": c.detector,
                 "region": list(c.region) if c.region else None,
                 "presence": [list(w) for w in c.presence],
+                "zone": [list(p) for p in c.zone] if c.zone else None,
                 "after": c.after, "before": c.before,
             })
         return jsonify(out)
@@ -1040,15 +1041,23 @@ async function runAll(){
 }
 
 async function preview(name){
+  // Same pipeline as the wizard's verify step — detection grade AND the
+  // Florence verdict when the verifier is configured.
+  const c = caseIndex[name];
+  if(!c) return;
   const div = document.getElementById('preview');
-  const bust = 't=' + Date.now();
-  const url = k => `api/preview/${encodeURIComponent(name)}.png?${bust}&kind=${k}`;
-  div.innerHTML = `<h2>Preview: ${name}</h2>
-    <div class="row" style="align-items:flex-start">
-      <div><div class="muted">detection</div><img class="preview" src="${url('detection')}"></div>
-      <div><div class="muted">diff mask</div><img class="preview" src="${url('mask')}"></div>
-    </div>
-    <div class="muted">Full frame with no box means nothing was detected.</div>`;
+  div.innerHTML = `<h2>Preview: ${name}</h2><div id="previewOut"></div>`;
+  if(!c.present){
+    document.getElementById('previewOut').innerHTML =
+      '<div class="muted">clip is not on this machine — cannot run</div>';
+    return;
+  }
+  await runCaseInto(document.getElementById('previewOut'), {
+    name: c.name, expect: c.expect, clip: c.clip,
+    description: c.description, fps: c.fps, detector: c.detector,
+    region: c.region, presence: c.presence, zone: c.zone,
+    after: c.after, before: c.before,
+  });
 }
 
 // ---- wizard shell ---------------------------------------------------------
@@ -1347,11 +1356,17 @@ function formCase(){
 }
 
 async function verify(){
-  const box = document.getElementById('verifyOut');
-  box.innerHTML = '<div class="muted">running detector…</div>';
+  await runCaseInto(document.getElementById('verifyOut'), formCase());
+}
+
+// Shared by the wizard's verify step and the case list's preview button:
+// run the detector (+ Florence when configured) and render the outcome.
+async function runCaseInto(box, payload){
+  box.innerHTML = '<div class="muted">running detector…'
+    + '<br>(the vision model adds a few seconds when configured)</div>';
   let res;
   try { res = await j('api/preview_case', {method:'POST',
-    headers:{'Content-Type':'application/json'}, body: JSON.stringify(formCase())}); }
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)}); }
   catch(e){ box.innerHTML = `<div class="fail">error: ${e}</div>`; return; }
   if(res.error){ box.innerHTML = `<div class="fail">error: ${res.error}</div>`; return; }
   const cls = res.passed ? 'pass' : 'fail';
