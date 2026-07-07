@@ -58,7 +58,7 @@ def test_build_verifier_off_and_unknown():
 
 
 def test_florence_verify_with_stubbed_caption(monkeypatch):
-    ver = FlorenceVerifier(VerifierConfig(backend="florence"))
+    ver = FlorenceVerifier(VerifierConfig(backend="florence", refine="off"))
     monkeypatch.setattr(
         ver, "_caption",
         lambda crop: "A cardboard package on the porch steps.")
@@ -67,6 +67,32 @@ def test_florence_verify_with_stubbed_caption(monkeypatch):
     assert verdict["accepted"] is True
     assert verdict["label"] == "package"
     assert verdict["backend"] == "florence"
+    assert verdict["refined"] is False
+
+
+def test_refined_crop_used_when_segmenter_returns_bbox(monkeypatch):
+    ver = FlorenceVerifier(VerifierConfig(backend="florence"))  # refine=sam2
+    seen = {}
+    monkeypatch.setattr(ver, "_mask_bbox",
+                        lambda frame, bbox: (150, 160, 30, 20))
+    def cap(crop):
+        seen["shape"] = crop.shape
+        return "a cardboard box"
+    monkeypatch.setattr(ver, "_caption", cap)
+    frame = make_frame(np.random.default_rng(1), package=True)
+    verdict = ver.verify(frame, PKG)
+    assert verdict["refined"] is True
+    # crop follows the refined bbox (30x20 + 20% margin), not the loose one
+    assert seen["shape"][0] < 40 and seen["shape"][1] < 50
+
+
+def test_refinement_failure_falls_back_to_plain_crop(monkeypatch):
+    ver = FlorenceVerifier(VerifierConfig(backend="florence"))
+    monkeypatch.setattr(ver, "_mask_bbox", lambda frame, bbox: None)
+    monkeypatch.setattr(ver, "_caption", lambda crop: "a cardboard box")
+    verdict = ver.verify(make_frame(np.random.default_rng(1), package=True),
+                         PKG)
+    assert verdict["accepted"] is True and verdict["refined"] is False
 
 
 # --- backtest engine ---------------------------------------------------------
@@ -222,7 +248,7 @@ def test_same_sample_hits_grouped_into_one_card():
 
 
 def test_verifier_attached_to_hits(monkeypatch):
-    ver = FlorenceVerifier(VerifierConfig(backend="florence"))
+    ver = FlorenceVerifier(VerifierConfig(backend="florence", refine="off"))
     monkeypatch.setattr(ver, "_caption", lambda crop: "a cardboard box")
     res = _run({0: {}, 6: {"package": True}}, verifier=ver)
     assert len(res.hits) == 1
