@@ -1299,16 +1299,23 @@ async function runBacktest(){
 }
 
 async function pollBt(){
-  const s = await j('api/backtest/status');
-  if(s.running){
-    msg('btStatus', `scanning… sample ${s.progress[0]}/${s.progress[1]}`
-      + (s.partial.length ? ` · ${s.partial.length} sample(s) with candidates so far` : ''));
-    if(s.partial.length) renderHits(s.partial);   // play forward as it scans
-    return;
+  // Any failure here must land in btStatus, never die silently — a blank
+  // results area with a happy summary is undebuggable from the UI.
+  try{
+    const s = await j('api/backtest/status');
+    if(s.running){
+      msg('btStatus', `scanning… sample ${s.progress[0]}/${s.progress[1]}`
+        + (s.partial.length ? ` · ${s.partial.length} sample(s) with candidates so far` : ''));
+      if(s.partial.length) renderHits(s.partial);   // play forward as it scans
+      return;
+    }
+    clearInterval(btTimer); btTimer = null;
+    if(s.error){ msg('btStatus','backtest failed: '+s.error); return; }
+    if(s.result) renderBt(s.result);
+  }catch(e){
+    msg('btStatus', 'display error: ' + (e && e.message ? e.message : e));
+    console.error('backtest render', e);
   }
-  clearInterval(btTimer); btTimer = null;
-  if(s.error){ msg('btStatus','backtest failed: '+s.error); return; }
-  if(s.result) renderBt(s.result);
 }
 
 function renderBt(r){
@@ -1326,7 +1333,6 @@ function renderBt(r){
 
 function renderHits(groups){
   const el = document.getElementById('btResults');
-  el.innerHTML = '';
   const grid = document.createElement('div');
   grid.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-top:10px';
   for(const g of groups){
@@ -1350,6 +1356,9 @@ function renderHits(groups){
       ${rows}`;
     grid.appendChild(card);
   }
+  // Build fully, then swap — a mid-render exception must not leave the
+  // results area wiped.
+  el.innerHTML = '';
   el.appendChild(grid);
 }
 
