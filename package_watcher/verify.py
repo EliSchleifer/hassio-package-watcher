@@ -30,8 +30,9 @@ log = logging.getLogger(__name__)
 
 # Captions we may see for non-deliveries, used only to give the verdict a
 # more useful label than "other" — rejection is driven by the accept list.
-_KNOWN_OTHERS = ("person", "bag", "newspaper", "cat", "dog", "shadow",
-                 "car", "plant", "chair", "bicycle")
+_KNOWN_OTHERS = ("person", "newspaper", "cat", "dog", "shadow",
+                 "car", "plant", "chair", "bicycle", "door", "wall",
+                 "ladder", "railing")
 
 
 def crop_with_margin(frame_bgr: np.ndarray, bbox: tuple[int, int, int, int],
@@ -102,23 +103,33 @@ class FlorenceVerifier:
                 self.cfg.model, **kwargs).eval()
             log.info("verifier model ready")
 
-    def _caption(self, crop_bgr: np.ndarray) -> str:
-        """One caption for one crop. Overridable in tests."""
+    def _generate(self, crop_bgr: np.ndarray, task: str,
+                  extra_text: str = ""):
         import torch
         from PIL import Image
 
         self._ensure_loaded()
         image = Image.fromarray(crop_bgr[:, :, ::-1])  # BGR -> RGB
-        inputs = self._processor(text=self.TASK, images=image,
+        inputs = self._processor(text=task + extra_text, images=image,
                                  return_tensors="pt")
         with torch.no_grad():
             ids = self._model.generate(
                 **inputs, max_new_tokens=64, num_beams=1, do_sample=False)
         raw = self._processor.batch_decode(ids, skip_special_tokens=False)[0]
-        parsed = self._processor.post_process_generation(
-            raw, task=self.TASK,
-            image_size=(image.width, image.height))
+        return self._processor.post_process_generation(
+            raw, task=task, image_size=(image.width, image.height))
+
+    def _caption(self, crop_bgr: np.ndarray) -> str:
+        """One caption for one crop. Overridable in tests."""
+        parsed = self._generate(crop_bgr, self.TASK)
         return str(parsed.get(self.TASK, "")).strip()
+
+    # NOTE on giving Florence "context": its captioner takes no instructions,
+    # and its open-vocabulary grounding task is NOT usable as an accept
+    # signal — validated on real footage, it "finds" the requested package
+    # phrase in doors, ladders, and bare walls. Context lives in the accept
+    # vocabulary instead; a true instruction-following VLM backend (Ollama /
+    # Claude) is the upgrade path if caption words ever stop being enough.
 
     # -- public API -------------------------------------------------------
     def verify(self, frame_bgr: np.ndarray,

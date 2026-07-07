@@ -1,56 +1,45 @@
-# Integration-test fixtures for package-watcher.
-#
-# Every case is a REAL clip plus an expectation. Author cases with the web
-# UI (`package-watcher ui`, or the add-on's sidebar panel): scrub a Protect
-# camera, mark in/out, draw the expected region, and person-presence windows
-# are imported from Protect automatically.
-#
-# Clips live in fixtures/clips/ and stay LOCAL (gitignored — real footage is
-# private). A case whose clip is absent is skipped, not failed, so this
-# manifest can be shared without sharing the footage.
-#
-# Fields:
-#   expect: detect | no_detect
-#   region: normalized x,y,w,h the detection must overlap (detect only)
-#   after/before: clip-time window in seconds (detect only)
-#   max_reports: cap on how many detections may fire
-#   fps: detector sampling rate over the clip (match your live sample_fps)
-#   detector: per-case config overrides, e.g. {mode: person_gated}
-#   presence: [[start_s, end_s], ...] person-in-frame windows (person-gated)
-#   attention: [[start_s, end_s], ...] trigger windows (background mode)
-#   zone: normalized polygon to watch
-#
-# Run:  pytest tests/test_fixtures.py
-#   or: package-watcher test --fixtures fixtures
-
 cases:
-  - name: box
-    expect: detect
-    clip: clips/666ca59f03d68803e4001229-20260705T230000.mp4
-    fps: 2.0
-    detector:
-      persist_samples: 6
-      mode: person_gated
-    region:
-    - 0.415
-    - 0.828
-    - 0.095
-    - 0.171
-    presence:
-    - - 138.5
-      - 158.4
-  - name: mailer
-    expect: detect
-    clip: clips/666ca59f03d68803e4001229-20260703T214732.mp4
-    fps: 2.0
-    detector:
-      persist_samples: 6
-      mode: person_gated
-    region:
-    - 0.535
-    - 0.795
-    - 0.077
-    - 0.197
-    presence:
-    - - 25.3
-      - 45.0
+- name: box
+  expect: detect
+  clip: clips/666ca59f03d68803e4001229-20260705T230000.mp4
+  fps: 2.0
+  detector:
+    persist_samples: 6
+    mode: person_gated
+  region:
+  - 0.415
+  - 0.828
+  - 0.095
+  - 0.171
+  presence:
+  - - 138.5
+    - 158.4
+  zone: &id001
+  - - 0.596
+    - 0.489
+  - - 0.71
+    - 0.0
+  - - 1.0
+    - 0.0
+  - - 0.993
+    - 1.0
+  - - 0.224
+    - 0.975
+  - - 0.222
+    - 0.486
+- name: mailer
+  expect: detect
+  clip: clips/666ca59f03d68803e4001229-20260703T214732.mp4
+  fps: 2.0
+  detector:
+    persist_samples: 6
+    mode: person_gated
+  region:
+  - 0.535
+  - 0.795
+  - 0.077
+  - 0.197
+  presence:
+  - - 25.3
+    - 45.0
+  zone: *id001
