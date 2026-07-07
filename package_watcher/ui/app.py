@@ -380,19 +380,6 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
     bt = {"running": False, "progress": [0, 0], "error": None, "result": None,
           "partial": []}
 
-    def _hit_jpg(hit) -> Optional[str]:
-        img = hit.frame.copy()
-        x, y, w, h = hit.bbox
-        th = max(2, img.shape[1] // 640)
-        cv2.rectangle(img, (x, y), (x + w, y + h), (60, 220, 60), th)
-        scale = 480 / img.shape[1]
-        if scale < 1:
-            img = cv2.resize(img, (480, int(img.shape[0] * scale)),
-                             interpolation=cv2.INTER_AREA)
-        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        return ("data:image/jpeg;base64," +
-                base64.b64encode(buf.tobytes()).decode()) if ok else None
-
     def _bt_json(res) -> dict[str, Any]:
         return {
             "camera_id": res.camera_id,
@@ -402,13 +389,7 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
             "samples_skipped_person": res.samples_skipped_person,
             "samples_missing": res.samples_missing,
             "scene_flips": res.scene_flips,
-            "hits": [{
-                "at": h.at.isoformat(),
-                "bbox_norm": [round(v, 4) for v in h.bbox_norm],
-                "confidence": round(h.confidence, 3),
-                "verification": h.verification,
-                "jpg": _hit_jpg(h),
-            } for h in res.hits],
+            "hits": _group_hits(res.hits),
         }
 
     @app.post("/api/backtest")
@@ -436,18 +417,19 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
                     windows = protect.person_windows(u, camera_id, start, end)
                 except Exception:  # noqa: BLE001 - windows are an optimization
                     windows = []
+                raw_hits: list = []
+
+                def stream(h):
+                    raw_hits.append(h)
+                    bt["partial"] = _group_hits(raw_hits)
+
                 res = btmod.run_backtest(
                     btmod.protect_snapshot_fn(u, camera_id), camera_id,
                     start, end, interval_s=interval_s,
                     person_windows=windows,
                     verifier=verifier if want_verify else None,
                     progress=lambda i, n: bt.update(progress=[i, n]),
-                    on_hit=lambda h: bt["partial"].append({
-                        "at": h.at.isoformat(),
-                        "bbox_norm": [round(v, 4) for v in h.bbox_norm],
-                        "confidence": round(h.confidence, 3),
-                        "verification": h.verification,
-                        "jpg": _hit_jpg(h)}))
+                    on_hit=stream)
                 bt["result"] = _bt_json(res)
             except Exception as exc:  # noqa: BLE001
                 bt["error"] = str(exc)
@@ -470,6 +452,48 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
 
 
 # --- helpers --------------------------------------------------------------
+
+def _group_jpg(frame, bboxes) -> Optional[str]:
+    """One frame with every candidate box of a sample drawn and numbered."""
+    import cv2
+
+    img = frame.copy()
+    th = max(2, img.shape[1] // 640)
+    for i, (x, y, w, h) in enumerate(bboxes, 1):
+        cv2.rectangle(img, (x, y), (x + w, y + h), (60, 220, 60), th)
+        cv2.putText(img, str(i), (x, max(18, y - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 220, 60), th)
+    scale = 480 / img.shape[1]
+    if scale < 1:
+        img = cv2.resize(img, (480, int(img.shape[0] * scale)),
+                         interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return ("data:image/jpeg;base64," +
+            base64.b64encode(buf.tobytes()).decode()) if ok else None
+
+
+def _group_hits(hits) -> list[dict[str, Any]]:
+    """One comparison can yield several blobs; present them as ONE sample
+    with numbered boxes, not as separate same-timestamp events."""
+    groups: dict[str, dict[str, Any]] = {}
+    frames: dict[str, Any] = {}
+    bboxes: dict[str, list] = {}
+    for h in hits:
+        key = h.at.isoformat()
+        g = groups.setdefault(key, {"at": key, "boxes": []})
+        frames[key] = h.frame  # same frame for every blob of the sample
+        bboxes.setdefault(key, []).append(h.bbox)
+        g["boxes"].append({
+            "bbox_norm": [round(v, 4) for v in h.bbox_norm],
+            "confidence": round(h.confidence, 3),
+            "verification": h.verification,
+        })
+    out = []
+    for key, g in groups.items():
+        g["jpg"] = _group_jpg(frames[key], bboxes[key])
+        out.append(g)
+    return out
+
 
 def _png_data_uri(img) -> Optional[str]:
     if img is None:
@@ -1278,7 +1302,7 @@ async function pollBt(){
   const s = await j('api/backtest/status');
   if(s.running){
     msg('btStatus', `scanning… sample ${s.progress[0]}/${s.progress[1]}`
-      + (s.partial.length ? ` · ${s.partial.length} candidate(s) so far` : ''));
+      + (s.partial.length ? ` · ${s.partial.length} sample(s) with candidates so far` : ''));
     if(s.partial.length) renderHits(s.partial);   // play forward as it scans
     return;
   }
@@ -1291,7 +1315,7 @@ function renderBt(r){
   msg('btStatus',
     `${r.samples_total} samples · ${r.samples_skipped_person} skipped (person)`
     + ` · ${r.samples_missing} missing · ${r.scene_flips} lighting flips`
-    + ` · ${r.hits.length} candidate(s)`);
+    + ` · ${r.hits.length} sample(s) with candidates`);
   if(!r.hits.length){
     document.getElementById('btResults').innerHTML =
       '<div class="muted" style="margin-top:8px">no candidate packages found</div>';
@@ -1300,23 +1324,30 @@ function renderBt(r){
   renderHits(r.hits);
 }
 
-function renderHits(hits){
+function renderHits(groups){
   const el = document.getElementById('btResults');
   el.innerHTML = '';
   const grid = document.createElement('div');
-  grid.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;margin-top:10px';
-  for(const h of hits){
-    const v = h.verification;
-    const vhtml = !v ? '<div class="muted">no 2nd stage</div>'
-      : v.error ? `<div class="muted">verifier error: ${v.error}</div>`
-      : `<div class="${v.accepted?'pass':'fail'}">${v.accepted?'✓':'✗'} “${v.caption}”</div>`;
+  grid.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-top:10px';
+  for(const g of groups){
+    // One card per SAMPLE; a comparison can yield several candidate boxes,
+    // numbered to match the labels drawn on the frame.
+    const rows = g.boxes.map((b, i) => {
+      const v = b.verification;
+      const vtxt = !v ? '<span class="muted">no 2nd stage</span>'
+        : v.error ? `<span class="muted">verifier error: ${v.error}</span>`
+        : `<span class="${v.accepted?'pass':'fail'}">${v.accepted?'✓':'✗'} “${v.caption}”</span>`;
+      return `<div class="muted" style="margin-top:4px"><b>#${i+1}</b>
+        conf ${b.confidence} · (${b.bbox_norm.join(', ')})<br>${vtxt}</div>`;
+    }).join('');
+    const anyAccepted = g.boxes.some(b => b.verification && b.verification.accepted);
     const card = document.createElement('div');
-    card.style.cssText = 'border:1px solid var(--line);border-radius:8px;padding:8px';
-    card.innerHTML = `${h.jpg?`<img src="${h.jpg}" style="width:100%;border-radius:5px">`:''}
-      <div><b>${new Date(h.at).toLocaleTimeString()}</b>
-        <span class="muted">conf ${h.confidence}</span></div>
-      <div class="muted">at (${h.bbox_norm.join(', ')})</div>
-      ${vhtml}`;
+    card.style.cssText = 'border:1px solid var(--line);border-radius:8px;padding:8px'
+      + (g.boxes.some(b=>b.verification) && !anyAccepted ? ';opacity:.55' : '');
+    card.innerHTML = `${g.jpg?`<img src="${g.jpg}" style="width:100%;border-radius:5px">`:''}
+      <div><b>${new Date(g.at).toLocaleTimeString()}</b>
+        <span class="muted">${g.boxes.length} candidate box(es)</span></div>
+      ${rows}`;
     grid.appendChild(card);
   }
   el.appendChild(grid);
