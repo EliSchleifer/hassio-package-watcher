@@ -174,6 +174,29 @@ def test_rearms_after_healing_reported_object():
     assert iou(reports2[0].bbox, second) > 0.5
 
 
+def test_extract_blobs_rejects_tall_person_shaped_blob():
+    det = StaticObjectDetector(DetectorConfig())
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    mask[10:30, 10:30] = 255       # 20x20 square, package-ish (aspect 1.0)
+    mask[5:45, 60:65] = 255        # 5x40 tall, a leg/upright person (aspect 8)
+    diff = np.full((100, 100), 200, dtype=np.uint8)
+    boxes = [b[0] for b in det._extract_blobs(mask, diff)]
+    assert (10, 10, 20, 20) in boxes           # compact package kept
+    assert (60, 5, 5, 40) not in boxes         # tall upright blob rejected
+
+
+def test_extract_blobs_rejects_wispy_low_extent_blob():
+    det = StaticObjectDetector(DetectorConfig())
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    # A hollow outline: 40x40 bbox but only a thin border is filled (extent
+    # ~0.19, below min_extent) — the shape of a diff outline, not a solid box.
+    mask[20:60, 20:60] = 255
+    mask[22:58, 22:58] = 0
+    diff = np.full((100, 100), 200, dtype=np.uint8)
+    boxes = [b[0] for b in det._extract_blobs(mask, diff)]
+    assert all(not (w >= 35 and h >= 35) for (x, y, w, h) in boxes)
+
+
 def test_bbox_scales_back_to_native_resolution():
     rng = np.random.default_rng(RNG_SEED)
     detector = StaticObjectDetector(fast_config(resize_width=160))
