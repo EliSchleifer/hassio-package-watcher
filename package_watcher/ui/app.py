@@ -298,7 +298,11 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
             presence = protect.person_windows(u, data["camera_id"], start, end)
         except Exception as exc:  # noqa: BLE001
             presence_error = str(exc)
+        # The camera's watch zone travels with the clip into the case, so
+        # fixtures never grade (or show) boxes outside the area we care about.
+        zone = _load_zones().get(data["camera_id"])
         return jsonify({"clip": f"clips/{fname}", "presence": presence,
+                        "zone": zone,
                         **({"presence_error": presence_error}
                            if presence_error else {})})
 
@@ -909,6 +913,7 @@ _PAGE = """<!doctype html>
         </select></div>
     </div>
     <label>Description</label><input id="description">
+    <div class="muted" id="caseZoneNote"></div>
     <div class="row">
       <div><label>Detection mode</label>
         <select id="mode">
@@ -1005,6 +1010,7 @@ function editCase(name){
   // Reopen the wizard on a saved case: clip playable, region drawn on the
   // video, every field editable. Saving overwrites the case by name.
   wiz.clip = c.clip;
+  wiz.zone = c.zone || null;
   document.getElementById('clip').value = c.clip || '';
   document.getElementById('name').value = c.name;
   document.getElementById('expect').value = c.expect;
@@ -1063,11 +1069,12 @@ async function preview(name){
 }
 
 // ---- wizard shell ---------------------------------------------------------
-let wiz = { clip:null };
+let wiz = { clip:null, zone:null };
 let step = 1;
 function openWiz(){
   // Fresh case: clear anything left over from a previous add/edit session.
   wiz.clip = null;
+  wiz.zone = null;
   for(const id of ['clip','name','description','presence','region','after','before'])
     document.getElementById(id).value = '';
   document.getElementById('expect').value = 'detect';
@@ -1112,6 +1119,9 @@ function srcTab(which){
 let region = null, drawMode = false, drawStart = null;
 
 function enterStep2(){
+  document.getElementById('caseZoneNote').textContent = wiz.zone
+    ? `camera watch zone attached (${wiz.zone.length} points) — boxes outside it are ignored`
+    : '';
   const drawer = document.getElementById('regionDrawer');
   const canDraw = !!wiz.clip && document.getElementById('expect').value === 'detect';
   drawer.style.display = canDraw ? '' : 'none';
@@ -1270,6 +1280,9 @@ async function makeClip(){
     body: JSON.stringify({camera_id: scrub.cam, start: atIso(scrub.inS), end: atIso(scrub.outS)})});
   if(res.error){ wizMsg('pull failed: '+res.error); return; }
   setClip(res.clip);
+  // The camera's watch zone rides along into the case: boxes outside the
+  // area we care about are never graded or shown.
+  wiz.zone = res.zone || null;
   // Protect also tells us when a person was in frame — pre-label the case
   // and suggest person-gated mode, the mode that ground truth exists for.
   if(res.presence && res.presence.length){
@@ -1351,6 +1364,7 @@ function formCase(){
     fps: parseFloat(document.getElementById('fps').value||'2'),
     detector: det,
     region: region ? region.split(/\\s+/).map(Number) : null,
+    zone: wiz.zone,
     presence: parsePresence(document.getElementById('presence').value),
     after: parseTime(document.getElementById('after').value),
     before: parseTime(document.getElementById('before').value),

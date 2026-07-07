@@ -38,8 +38,8 @@ def test_decide_rejects_and_labels_known_other():
 
 def test_decide_matches_whole_words_only():
     # 'cat' must not match inside 'scattered'; 'box' not inside 'boxer'.
-    v = decide("White dots scattered on a wall.", ["package"])
-    assert v["label"] == "other"
+    v = decide("White dots scattered on the ground.", ["package"])
+    assert v["label"] == "other"          # NOT 'cat' (inside 'scattered')
     v2 = decide("A boxer training in a gym.", ["box"])
     assert v2["accepted"] is False
 

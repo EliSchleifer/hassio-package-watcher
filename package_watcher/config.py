@@ -69,9 +69,13 @@ class VerifierConfig:
     # transformers support (microsoft/* still targets trust_remote_code).
     model: str = "florence-community/Florence-2-base"
     cache_dir: Optional[str] = None  # model download cache (default: HF cache)
-    # Caption keywords that count as a delivered item.
+    # Caption keywords that count as a delivered item. Florence describes
+    # what it sees with no scene context, so soft packages need soft words:
+    # a white poly mailer at night reliably captions as "pillow"/"paper".
+    # Tune per deployment against your own fixture clips.
     accept: list[str] = field(default_factory=lambda: [
-        "package", "box", "parcel", "carton", "envelope", "crate"])
+        "package", "box", "parcel", "carton", "envelope", "crate", "mailer",
+        "bag"])
     crop_margin: float = 0.35        # context margin around the bbox crop
     suppress_rejected: bool = False  # drop events whose crop isn't accepted
 
