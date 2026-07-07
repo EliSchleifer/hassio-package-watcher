@@ -65,14 +65,21 @@ def _setup_unifi(path: str) -> None:
     import yaml
 
     print(f"Set up UniFi Protect credentials (written to {path}).\n"
+          f"Pulling recorded footage uses Protect's private API, which needs a "
+          f"local Protect account (username + password). An API key is optional "
+          f"— it only unlocks the newer public API, not clip export.\n"
           f"Leave the host blank to skip.", file=sys.stderr)
     host = input("  NVR host / IP: ").strip()
     if not host:
         print("  skipped.", file=sys.stderr)
         return
-    username = input("  username (blank if using an API key): ").strip()
-    password = getpass.getpass("  password (blank if using an API key): ").strip()
-    api_key = getpass.getpass("  API key (blank if using user/pass): ").strip()
+    username = input("  username: ").strip()
+    password = getpass.getpass("  password: ").strip()
+    api_key = getpass.getpass("  API key (optional, Enter to skip): ").strip()
+    if not (username and password):
+        print("  warning: without a username + password, recorded-clip pull "
+               "and scrubbing will not work (API key alone is public-only).",
+               file=sys.stderr)
     block: dict = {"host": host, "verify_ssl": False}
     if username:
         block["username"] = username
