@@ -357,6 +357,20 @@ def test_person_gated_case_end_to_end(client):
     assert saved["presence"] == [[8.0, 14.0]]
     assert saved["region"] == list(PKG_REGION)
 
+    # The case-list preview PNG must show the SAME detection the grade was
+    # based on: the green box drawn at the package, not at the first blob.
+    import cv2
+    import numpy as np
+    from videogen import PKG
+
+    png = c.get("/api/preview/gated-real-delivery.png?kind=detection").data
+    img = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
+    x, y, w, h = PKG
+    pad = 6
+    roi = img[max(0, y - pad):y + h + pad, max(0, x - pad):x + w + pad]
+    green = ((roi[:, :, 0] < 120) & (roi[:, :, 1] > 170) & (roi[:, :, 2] < 120))
+    assert green.sum() > 20, "matching detection box not drawn at the package"
+
 
 def test_cameras_use_discovered_protect(client, monkeypatch):
     from package_watcher.ui import hass, protect
