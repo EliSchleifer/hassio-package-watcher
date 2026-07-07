@@ -101,29 +101,81 @@ def _run(events, windows=(), samples=12, verifier=None):
         person_pad_s=0.0)
 
 
-def test_package_arrival_is_hit_once_at_right_spot():
-    # Package appears at sample 6 and stays; exactly one hit, then absorbed.
+def test_package_arrival_confirms_after_persisting():
+    # Package appears at sample 6 and stays. It is seen at 6 (reference
+    # held), CONFIRMS at 7 (still in the same spot), then is absorbed.
     res = _run({0: {}, 6: {"package": True}})
     assert len(res.hits) == 1
     hit = res.hits[0]
-    assert hit.at == DAY + timedelta(seconds=600 * 6)
+    assert hit.at == DAY + timedelta(seconds=600 * 7)
     x, y, w, h = PKG
     hx, hy, hw, hh = hit.bbox
     assert abs(hx - x) < 12 and abs(hy - y) < 12
-    # The comparison pair rides along: baseline = previous clean sample.
-    assert hit.baseline_at == DAY + timedelta(seconds=600 * 5)
+    # The comparison pair rides along. The reference rolls every sample
+    # (lighting tracks) but the candidate's region keeps its PRE-ARRIVAL
+    # pixels, so the baseline shows the empty spot where the box now is.
+    assert hit.baseline_at == DAY + timedelta(seconds=600 * 6)
     assert hit.baseline is not None and hit.baseline.shape == hit.frame.shape
+    x, y, w, h = PKG
+    region = hit.baseline[y:y + h, x:x + w]
+    assert abs(float(region.mean()) - 120) < 15   # pre-arrival background
 
 
 def test_person_windows_are_skipped():
     # Person present during samples 4-5 (2400-3000s); package appears with
-    # them and remains. The hit lands on the first clean sample after.
+    # them and remains. Seen at 6, confirmed at 7, baseline = last clean
+    # sample before the visit (sample 3).
     res = _run({0: {}, 4: {"person": True, "package": True},
                 6: {"package": True}},
                windows=[(2400.0, 3300.0)])
     assert res.samples_skipped_person == 2
     assert len(res.hits) == 1
-    assert res.hits[0].at == DAY + timedelta(seconds=600 * 6)
+    assert res.hits[0].at == DAY + timedelta(seconds=600 * 7)
+    # Baseline label = previous processed sample; the package's region in it
+    # still shows the pre-visit scene (masked absorption).
+    assert res.hits[0].baseline_at == DAY + timedelta(seconds=600 * 6)
+    x, y, w, h = PKG
+    region = res.hits[0].baseline[y:y + h, x:x + w]
+    assert abs(float(region.mean()) - 120) < 15
+
+
+def test_moving_shadow_never_confirms():
+    # A shadow patch that creeps across the frame overlaps its own previous
+    # position (IoU-wise) but its PIXELS shift every sample — the stillness
+    # check must keep it from ever confirming. (Known limitation: a shadow
+    # sliding off the frame edge can read as still for a couple of samples;
+    # the vision verdict is the net for that.)
+    rng = np.random.default_rng(4)
+
+    def fn(at):
+        i = int((at - DAY).total_seconds() // 600)
+        f = make_frame(rng)
+        x = 30 + i * 30                       # moves 30 px per sample
+        f[150:190, x:x + 50] = (60, 60, 60)   # 50x40 dark patch
+        return f
+
+    res = run_backtest(fn, "cam", DAY, DAY + timedelta(seconds=600 * 8),
+                       interval_s=600)
+    assert res.hits == []
+
+
+def test_package_still_confirms_despite_nearby_shadow_motion():
+    # The stillness gate must not throw away real arrivals: package lands at
+    # sample 5 while a shadow creeps elsewhere in the frame.
+    rng = np.random.default_rng(9)
+
+    def fn(at):
+        i = int((at - DAY).total_seconds() // 600)
+        f = make_frame(rng, package=(i >= 5))
+        x = 20 + i * 25
+        f[30:60, x:x + 40] = (70, 70, 70)     # unrelated creeping shadow, top
+        return f
+
+    res = run_backtest(fn, "cam", DAY, DAY + timedelta(seconds=600 * 9),
+                       interval_s=600)
+    pkg_hits = [h for h in res.hits
+                if abs(h.bbox[0] - PKG[0]) < 15 and abs(h.bbox[1] - PKG[1]) < 15]
+    assert len(pkg_hits) == 1
 
 
 def test_missing_snapshots_counted_not_fatal():
@@ -175,3 +227,18 @@ def test_verifier_attached_to_hits(monkeypatch):
     res = _run({0: {}, 6: {"package": True}}, verifier=ver)
     assert len(res.hits) == 1
     assert res.hits[0].verification["accepted"] is True
+
+
+def test_verifier_status_endpoint(tmp_path, monkeypatch):
+    pytest.importorskip("flask")
+    from package_watcher.ui.app import create_app
+
+    (tmp_path / "cases.yaml").write_text("cases: []\n")
+    off = create_app(str(tmp_path)).test_client().get("/api/verifier").get_json()
+    assert off["configured"] is False
+
+    on = create_app(str(tmp_path),
+                    verifier_cfg=VerifierConfig(backend="florence"))
+    body = on.test_client().get("/api/verifier").get_json()
+    assert body["configured"] is True and body["loaded"] is False
+    assert body["backend"] == "florence"
