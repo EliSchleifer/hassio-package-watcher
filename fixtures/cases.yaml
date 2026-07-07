@@ -39,3 +39,18 @@ cases:
     presence:
     - - 138.5
       - 158.4
+  - name: mailer
+    expect: detect
+    clip: clips/666ca59f03d68803e4001229-20260703T214732.mp4
+    fps: 2.0
+    detector:
+      persist_samples: 6
+      mode: person_gated
+    region:
+    - 0.535
+    - 0.795
+    - 0.077
+    - 0.197
+    presence:
+    - - 25.3
+      - 45.0
