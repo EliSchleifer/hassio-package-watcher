@@ -1,121 +1,41 @@
 # Integration-test fixtures for package-watcher.
 #
-# Each case is a clip + an expectation. A clip is either:
-#   scene: {...}   a synthetic, seeded scenario (renders identically every
-#                  run — used so CI needs no committed video), or
-#   clip: path     a real video file relative to this fixtures/ directory
-#                  (drop your Protect exports into fixtures/clips/).
+# Every case is a REAL clip plus an expectation. Author cases with the web
+# UI (`package-watcher ui`, or the add-on's sidebar panel): scrub a Protect
+# camera, mark in/out, draw the expected region, and person-presence windows
+# are imported from Protect automatically.
 #
-# expect: detect | no_detect
-# Optional for a "detect" case: region (normalized x,y,w,h the detection must
-# overlap), after/before (clip-time window in seconds), max_reports.
-# Optional anywhere: fps, zone, detector (per-case config overrides),
-# attention (list of [start_s, end_s] windows simulating Protect triggers),
-# presence (list of [start_s, end_s] person-in-frame windows — drives
-# detector: {mode: person_gated}, which compares the person-free scene
-# after a visit against the person-free scene before it).
+# Clips live in fixtures/clips/ and stay LOCAL (gitignored — real footage is
+# private). A case whose clip is absent is skipped, not failed, so this
+# manifest can be shared without sharing the footage.
+#
+# Fields:
+#   expect: detect | no_detect
+#   region: normalized x,y,w,h the detection must overlap (detect only)
+#   after/before: clip-time window in seconds (detect only)
+#   max_reports: cap on how many detections may fire
+#   fps: detector sampling rate over the clip (match your live sample_fps)
+#   detector: per-case config overrides, e.g. {mode: person_gated}
+#   presence: [[start_s, end_s], ...] person-in-frame windows (person-gated)
+#   attention: [[start_s, end_s], ...] trigger windows (background mode)
+#   zone: normalized polygon to watch
 #
 # Run:  pytest tests/test_fixtures.py
 #   or: package-watcher test --fixtures fixtures
 
 cases:
-  # --- should detect --------------------------------------------------
-  - name: package-dropped-on-porch
-    description: A parcel appears and stays put on the stoop.
-    scene: {scene: package, warmup_s: 12, hold_s: 16}
-    fps: 2.0
-    detector: {persist_samples: 6}
+  - name: box
     expect: detect
-    region: [0.40, 0.58, 0.22, 0.22]
-    after: 6
-
-  - name: delivery-person-then-package
-    description: Person walks up, leaves, parcel remains (with a trigger window).
-    scene: {scene: person_then_package, warmup_s: 8, cross_s: 6, gap_s: 3, hold_s: 16}
+    clip: clips/666ca59f03d68803e4001229-20260705T230000.mp4
     fps: 2.0
-    detector: {persist_samples: 6, persist_samples_triggered: 4}
-    attention: [[4.0, 12.0]]
-    expect: detect
-    region: [0.40, 0.58, 0.22, 0.22]
-
-  - name: gated-delivery
-    description: >-
-      Person-gated mode; a person visits, the box lands mid-visit, and the
-      comparison after they leave finds exactly the box.
-    scene: {scene: delivery, warmup_s: 8, approach_s: 3, drop_s: 3, tail_s: 12}
-    fps: 2.0
-    detector: {mode: person_gated, settle_samples: 3}
-    presence: [[8.0, 14.0]]
-    expect: detect
-    region: [0.40, 0.58, 0.22, 0.22]
-    max_reports: 1
-
-  # --- should NOT detect ----------------------------------------------
-  - name: gated-person-pauses
-    description: >-
-      Person-gated mode; a person stands around for a while and leaves
-      nothing — the classic background-model false positive.
-    scene: {scene: person_pauses, warmup_s: 8, walk_s: 3, pause_s: 10, tail_s: 10}
-    fps: 2.0
-    detector: {mode: person_gated}
-    presence: [[8.0, 24.0]]
-    expect: no_detect
-
-  - name: empty-porch-noise-only
-    description: Nothing happens; only sensor noise.
-    scene: {scene: empty, seconds: 30}
-    fps: 2.0
-    detector: {persist_samples: 6}
-    expect: no_detect
-
-  - name: person-walks-through
-    description: A person crosses the frame but leaves nothing behind.
-    scene: {scene: person_only, warmup_s: 10, cross_s: 6, tail_s: 12}
-    fps: 2.0
-    detector: {persist_samples: 6}
-    expect: no_detect
-
-  - name: gradual-lighting-drift
-    description: Slow sunrise-style brightening must not fire.
-    scene: {scene: lighting_drift, seconds: 40, rate: 1.0}
-    fps: 2.0
-    detector: {persist_samples: 6}
-    expect: no_detect
-
-  - name: porch-light-switched-on
-    description: Sudden light change triggers a scene reset, not a detection.
-    scene: {scene: light_switch, before_s: 10, after_s: 20, delta: 80}
-    fps: 2.0
-    detector: {persist_samples: 6}
-    expect: no_detect
-
-  - name: moving-shadow
-    description: A drifting shadow band keeps moving and must be ignored.
-    scene: {scene: shadow_sweep, warmup_s: 6, sweep_s: 8, tail_s: 6}
-    fps: 2.0
-    detector: {persist_samples: 6}
-    expect: no_detect
-
-  - name: package-outside-zone
-    description: Parcel lands outside the watched porch polygon (left half only).
-    scene: {scene: package, warmup_s: 12, hold_s: 16}
-    fps: 2.0
-    detector: {persist_samples: 6}
-    zone: [[0.0, 0.0], [0.35, 0.0], [0.35, 1.0], [0.0, 1.0]]
-    expect: no_detect
-
-  # --- real-clip examples (add your own Protect exports) --------------
-  # Use the authoring UI (`package-watcher ui`) to pull a clip from a
-  # Protect camera by begin/end time, label it, and it will be appended
-  # here. These are skipped by the test suite until the file exists.
-  #
-  # - name: real-amazon-box-2026-07-04
-  #   clip: clips/real-amazon-box-2026-07-04.mp4
-  #   fps: 2.0
-  #   expect: detect
-  #   region: [0.35, 0.55, 0.3, 0.35]
-  #
-  # - name: real-cat-on-porch-no-package
-  #   clip: clips/real-cat-2026-07-05.mp4
-  #   fps: 2.0
-  #   expect: no_detect
+    detector:
+      persist_samples: 6
+      mode: person_gated
+    region:
+    - 0.415
+    - 0.828
+    - 0.095
+    - 0.171
+    presence:
+    - - 139.5
+      - 156.4

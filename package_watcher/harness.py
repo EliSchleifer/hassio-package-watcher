@@ -1,10 +1,14 @@
 """Integration-test harness: play a clip through the detector and grade it.
 
-A *fixture case* is a clip (a real video file or a synthetic scenario) plus
-an expectation — "this should detect a package" or "this should not". The
-harness runs the detector over the clip with **video-relative timestamps**
-(sample `i` at `i / fps` seconds, no wall clock) so a case grades identically
-every run, then compares the reports against the expectation.
+A *fixture case* is a real video clip plus an expectation — "this should
+detect a package" or "this should not". The harness runs the detector over
+the clip with **video-relative timestamps** (sample `i` at `i / fps` seconds,
+no wall clock) so a case grades identically every run, then compares the
+reports against the expectation.
+
+Clips are real footage and stay local (fixtures/clips/ is gitignored); a
+case whose clip is absent is skipped, not failed, so the manifest can be
+shared without sharing the footage.
 
 This is the backbone the pytest fixture suite and the authoring UI both call.
 """
@@ -19,7 +23,6 @@ import numpy as np
 import yaml
 
 from .detector import DetectorConfig, NewObjectReport, build_detector
-from . import synthetic
 
 
 @dataclass
@@ -27,7 +30,6 @@ class FixtureCase:
     name: str
     expect: str                       # "detect" | "no_detect"
     clip: Optional[str] = None        # path relative to the fixtures dir
-    scene: Optional[dict[str, Any]] = None  # synthetic scenario spec
     fps: float = 2.0
     zone: Optional[list[tuple[float, float]]] = None
     detector: dict[str, Any] = field(default_factory=dict)  # config overrides
@@ -47,9 +49,8 @@ class FixtureCase:
         if self.expect not in ("detect", "no_detect"):
             raise ValueError(
                 f"case {self.name!r}: expect must be 'detect' or 'no_detect'")
-        if not self.clip and not self.scene:
-            raise ValueError(
-                f"case {self.name!r}: needs either 'clip' or 'scene'")
+        if not self.clip:
+            raise ValueError(f"case {self.name!r}: needs a clip")
 
 
 @dataclass
@@ -117,13 +118,6 @@ def load_cases(manifest_path: str) -> list[FixtureCase]:
 def iter_samples(case: FixtureCase, fixtures_dir: str
                  ) -> Iterator[tuple[np.ndarray, float]]:
     """Yield (frame, clip_relative_seconds) for a case, deterministically."""
-    if case.scene:
-        spec = {"fps": case.fps, **case.scene}
-        frames = synthetic.render(spec)
-        for i, frame in enumerate(frames):
-            yield frame, i / case.fps
-        return
-
     import cv2
 
     path = case.clip if os.path.isabs(case.clip) else \

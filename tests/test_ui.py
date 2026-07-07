@@ -16,9 +16,12 @@ flask = pytest.importorskip("flask")
 
 from package_watcher.ui.app import create_app  # noqa: E402
 
+from videogen import (PKG_REGION, delivery_clip, empty_clip,  # noqa: E402
+                      package_clip)
+
 MANIFEST = """cases:
   - name: seed-empty
-    scene: {scene: empty, seconds: 10}
+    clip: clips/seed-empty.mp4
     fps: 2.0
     expect: no_detect
 """
@@ -27,7 +30,8 @@ MANIFEST = """cases:
 @pytest.fixture()
 def client(tmp_path):
     fixtures = tmp_path / "fixtures"
-    fixtures.mkdir()
+    (fixtures / "clips").mkdir(parents=True)
+    empty_clip(fixtures / "clips" / "seed-empty.mp4", seconds=10)
     (fixtures / "cases.yaml").write_text(MANIFEST)
     app = create_app(str(fixtures), unifi=None)
     app.config.update(TESTING=True)
@@ -207,7 +211,7 @@ def test_preview_case_runs_unsaved(client):
     c, _ = client
     r = c.post("/api/preview_case", json={
         "name": "adhoc-empty", "expect": "no_detect",
-        "scene": {"scene": "empty", "seconds": 8}, "fps": 2.0,
+        "clip": "clips/seed-empty.mp4", "fps": 2.0,
     })
     body = r.get_json()
     assert r.status_code == 200
@@ -218,10 +222,11 @@ def test_preview_case_runs_unsaved(client):
 
 
 def test_preview_case_reports_detection_image(client):
-    c, _ = client
+    c, fixtures = client
+    package_clip(fixtures / "clips" / "pkg.mp4")
     r = c.post("/api/preview_case", json={
         "name": "adhoc-pkg", "expect": "detect",
-        "scene": {"scene": "package", "hold_s": 14}, "fps": 2.0,
+        "clip": "clips/pkg.mp4", "fps": 2.0,
         "detector": {"persist_samples": 6},
     })
     body = r.get_json()
@@ -234,12 +239,13 @@ def test_preview_case_reports_detection_image(client):
 
 
 def test_preview_case_overlays_expected_region(client):
-    c, _ = client
+    c, fixtures = client
+    package_clip(fixtures / "clips" / "pkg.mp4")
     r = c.post("/api/preview_case", json={
         "name": "adhoc-region", "expect": "detect",
-        "scene": {"scene": "package", "hold_s": 14}, "fps": 2.0,
+        "clip": "clips/pkg.mp4", "fps": 2.0,
         "detector": {"persist_samples": 6},
-        "region": [0.4, 0.5, 0.3, 0.35],
+        "region": list(PKG_REGION),
     })
     body = r.get_json()
     assert r.status_code == 200
@@ -319,16 +325,18 @@ def test_pull_survives_presence_failure(client, monkeypatch):
 
 
 def test_person_gated_case_end_to_end(client):
-    """Wizard round-trip: preview an unsaved gated case, save it, run it."""
+    """Wizard round-trip: preview an unsaved gated case, save it, run it,
+    then reopen it via the case list (full detail comes back)."""
     c, fixtures = client
+    delivery_clip(fixtures / "clips" / "delivery.mp4",
+                  warmup_s=8, visit_s=6, tail_s=12)
     payload = {
-        "name": "gated-synthetic-delivery", "expect": "detect",
-        "scene": {"scene": "delivery", "warmup_s": 8, "approach_s": 3,
-                  "drop_s": 3, "tail_s": 12},
+        "name": "gated-real-delivery", "expect": "detect",
+        "clip": "clips/delivery.mp4",
         "fps": 2.0,
         "detector": {"mode": "person_gated", "settle_samples": 3},
         "presence": [[8.0, 14.0]],
-        "region": [0.40, 0.58, 0.22, 0.22],
+        "region": list(PKG_REGION),
     }
     # Verify step grades it before saving.
     prev = c.post("/api/preview_case", json=payload).get_json()
@@ -339,7 +347,15 @@ def test_person_gated_case_end_to_end(client):
     text = (fixtures / "cases.yaml").read_text()
     assert "mode: person_gated" in text and "presence:" in text
     res = {r["name"]: r for r in c.post("/api/run").get_json()}
-    assert res["gated-synthetic-delivery"]["status"] == "pass"
+    assert res["gated-real-delivery"]["status"] == "pass"
+
+    # Reopening: the case list carries everything the wizard needs to edit.
+    listed = {x["name"]: x for x in c.get("/api/cases").get_json()}
+    saved = listed["gated-real-delivery"]
+    assert saved["clip"] == "clips/delivery.mp4" and saved["present"] is True
+    assert saved["detector"]["mode"] == "person_gated"
+    assert saved["presence"] == [[8.0, 14.0]]
+    assert saved["region"] == list(PKG_REGION)
 
 
 def test_cameras_use_discovered_protect(client, monkeypatch):
@@ -362,31 +378,32 @@ def test_cameras_use_discovered_protect(client, monkeypatch):
 
 def test_save_new_case_appends_and_preserves(client):
     c, fixtures = client
+    package_clip(fixtures / "clips" / "pkg.mp4")
     payload = {
-        "name": "new synthetic pkg", "expect": "detect",
-        "scene": {"scene": "package", "hold_s": 14},
+        "name": "new real pkg", "expect": "detect",
+        "clip": "clips/pkg.mp4",
         "fps": 2.0, "detector": {"persist_samples": 6},
-        "region": [0.4, 0.58, 0.22, 0.22], "after": "6",
+        "region": list(PKG_REGION), "after": "6",
     }
     r = c.post("/api/save_case", json=payload)
     assert r.status_code == 200
-    assert r.get_json()["saved"] == "new-synthetic-pkg"
+    assert r.get_json()["saved"] == "new-real-pkg"
 
     text = (fixtures / "cases.yaml").read_text()
     assert "seed-empty" in text          # original survived
-    assert "new-synthetic-pkg" in text   # new one appended
+    assert "new-real-pkg" in text        # new one appended
 
     names = [x["name"] for x in c.get("/api/cases").get_json()]
-    assert "new-synthetic-pkg" in names
+    assert "new-real-pkg" in names
     # And it actually runs + passes through the harness.
     res = {r["name"]: r for r in c.post("/api/run").get_json()}
-    assert res["new-synthetic-pkg"]["status"] == "pass"
+    assert res["new-real-pkg"]["status"] == "pass"
 
 
 def test_save_rejects_bad_expect(client):
     c, _ = client
     r = c.post("/api/save_case", json={"name": "x", "expect": "maybe",
-                                       "scene": {"scene": "empty"}})
+                                       "clip": "clips/x.mp4"})
     assert r.status_code == 400
 
 

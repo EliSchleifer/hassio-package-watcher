@@ -1,14 +1,16 @@
 """Flask app for authoring and running fixture cases.
 
 Workflow the UI supports:
-  1. Point at a Protect camera and pull a clip by begin/end time (or upload
-     a local video, or reference one already in fixtures/clips/).
-  2. Label it "should detect a package" or "should NOT", optionally draw an
-     expected region and set a time window.
-  3. Preview: run the detector on the clip and see what it found (annotated
-     frame, baseline, diff mask) so you can confirm/tune before saving.
+  1. Pull a real clip from a Protect camera (scrub, mark in/out — person
+     presence windows are imported automatically), upload a local video, or
+     reference one already in fixtures/clips/.
+  2. Label it "should detect a package" or "should NOT"; draw the expected
+     region on the clip; pick the detection mode.
+  3. Verify: run the detector on the unsaved case and confirm it grades the
+     way you intend (annotated frame, diff mask, pass/fail).
   4. Save it into fixtures/cases.yaml — where `pytest` / `package-watcher
-     test` will grade it from then on.
+     test` will grade it from then on. Saved cases can be reopened, watched,
+     and edited from the case list.
 
 Single-file app with embedded templates so it has no asset build step.
 """
@@ -87,16 +89,19 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
         cases = load_cases(manifest_path) if os.path.isfile(manifest_path) else []
         out = []
         for c in cases:
-            present = True
-            if c.clip:
-                p = (c.clip if os.path.isabs(c.clip)
-                     else os.path.join(fixtures_dir, c.clip))
-                present = os.path.isfile(p)
+            p = (c.clip if os.path.isabs(c.clip)
+                 else os.path.join(fixtures_dir, c.clip))
             out.append({
+                # Full detail so the UI can reopen a saved case for review
+                # and editing, not just list it.
                 "name": c.name, "expect": c.expect,
-                "source": "clip" if c.clip else "synthetic",
                 "clip": c.clip, "description": c.description,
-                "present": present,
+                "present": os.path.isfile(p),
+                "fps": c.fps,
+                "detector": c.detector,
+                "region": list(c.region) if c.region else None,
+                "presence": [list(w) for w in c.presence],
+                "after": c.after, "before": c.before,
             })
         return jsonify(out)
 
@@ -366,10 +371,8 @@ def _case_from_form(data: dict[str, Any]) -> dict[str, Any]:
         case["description"] = data["description"]
     if data.get("clip"):
         case["clip"] = data["clip"]
-    elif data.get("scene"):
-        case["scene"] = data["scene"]
     else:
-        raise ValueError("a clip or a synthetic scene is required")
+        raise ValueError("a clip is required")
     case["fps"] = float(data.get("fps", 2.0))
     if data.get("detector"):
         case["detector"] = data["detector"]
@@ -527,7 +530,7 @@ _PAGE = """<!doctype html>
     <div id="step1tabs" class="row tight" style="gap:6px;margin-bottom:8px">
       <button class="tab" data-src="scrub" onclick="srcTab('scrub')">Scrub Protect</button>
       <button class="tab" data-src="upload" onclick="srcTab('upload')">Upload file</button>
-      <button class="tab" data-src="ref" onclick="srcTab('ref')">Reference / synthetic</button>
+      <button class="tab" data-src="ref" onclick="srcTab('ref')">Reference a clip</button>
     </div>
 
     <div class="srcpane" data-src="scrub">
@@ -577,8 +580,6 @@ _PAGE = """<!doctype html>
     <div class="srcpane" data-src="ref" style="display:none">
       <label>Reference an existing clip (relative to the fixtures dir)</label>
       <input id="clip" placeholder="clips/my-clip.mp4" onchange="refClip()">
-      <label>…or a synthetic scene (JSON) — leave clip blank</label>
-      <input id="scene" placeholder='{"scene":"package","hold_s":16}' oninput="onScene()">
     </div>
 
     <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
@@ -606,7 +607,7 @@ _PAGE = """<!doctype html>
       <div><label>persist_samples</label><input id="persist" value="6"></div>
     </div>
     <div id="presenceRow">
-      <label>Person present (seconds, e.g. <code>8-14, 22-25</code>)</label>
+      <label>Person present (clip time, e.g. <code>2:19-2:36, 0:08-0:14</code>)</label>
       <input id="presence" placeholder="auto-filled from Protect when pulling a clip">
       <div class="muted">Person-gated mode ignores everything while a person is
         in frame and compares the clean scene after each visit against the
@@ -628,12 +629,15 @@ _PAGE = """<!doctype html>
                style="width:100%;display:block;border:1px solid var(--line);border-radius:6px"></video>
         <canvas id="rcanvas" style="position:absolute;left:0;top:0;pointer-events:none"></canvas>
       </div>
+      <div class="muted" id="vidTime" style="text-align:right"></div>
       <input id="region" type="hidden">
     </div>
 
+    <label>Detection time window (optional, detect only) — the detection only
+      counts if it fires inside this range of clip time</label>
     <div class="row">
-      <div><label>After (s)</label><input id="after"></div>
-      <div><label>Before (s)</label><input id="before"></div>
+      <div><label>no earlier than</label><input id="after" placeholder="e.g. 2:30"></div>
+      <div><label>no later than</label><input id="before" placeholder="leave blank = any"></div>
     </div>
   </div>
 
@@ -662,19 +666,54 @@ function msg(id, text){ document.getElementById(id).textContent = text; }
 function wizMsg(t){ msg('wizMsg', t); }
 
 // ---- case list + run all --------------------------------------------------
+let caseIndex = {};   // name -> full case detail, for reopening/editing
+
 async function loadCases(){
   const cases = await j('api/cases');
+  caseIndex = {};
   const tb = document.querySelector('#cases tbody');
   tb.innerHTML = '';
   for(const c of cases){
+    caseIndex[c.name] = c;
+    const mode = (c.detector && c.detector.mode) || 'background';
     const tr = document.createElement('tr');
     tr.innerHTML = `<td><b>${c.name}</b><div class="reason">${c.description||''}</div></td>
-      <td><span class="pill">${c.expect}</span></td>
-      <td class="muted">${c.source}${c.present?'':' ⚠ missing'}</td>
-      <td><button onclick="preview('${c.name}')">preview</button></td>
+      <td><span class="pill">${c.expect}</span> <span class="pill">${mode}</span></td>
+      <td class="muted">${c.present?'':'⚠ clip missing'}</td>
+      <td><button onclick="editCase('${c.name}')">open</button>
+          <button onclick="preview('${c.name}')">preview</button></td>
       <td id="st-${cssId(c.name)}"></td>`;
     tb.appendChild(tr);
   }
+}
+
+function editCase(name){
+  const c = caseIndex[name];
+  if(!c) return;
+  // Reopen the wizard on a saved case: clip playable, region drawn on the
+  // video, every field editable. Saving overwrites the case by name.
+  wiz.clip = c.clip;
+  document.getElementById('clip').value = c.clip || '';
+  document.getElementById('name').value = c.name;
+  document.getElementById('expect').value = c.expect;
+  document.getElementById('description').value = c.description || '';
+  document.getElementById('fps').value = c.fps != null ? c.fps : '2.0';
+  document.getElementById('persist').value =
+    (c.detector && c.detector.persist_samples) || '6';
+  document.getElementById('mode').value =
+    (c.detector && c.detector.mode) || 'background';
+  document.getElementById('presence').value =
+    (c.presence || []).map(w => `${fmtTime(w[0])}-${fmtTime(w[1])}`).join(', ');
+  document.getElementById('region').value =
+    c.region ? c.region.join(' ') : '';
+  document.getElementById('after').value = c.after != null ? fmtTime(c.after) : '';
+  document.getElementById('before').value = c.before != null ? fmtTime(c.before) : '';
+  renderWatch();
+  step = 2;  // straight to the clip + region view; Back reaches the source
+  showStep();
+  document.getElementById('modal').style.display = 'flex';
+  if(!c.present) wizMsg('clip file is missing on this machine — the case is '
+    + 'editable but cannot be verified here');
 }
 function cssId(s){ return s.replace(/[^a-z0-9]/gi,'_'); }
 
@@ -706,7 +745,21 @@ async function preview(name){
 // ---- wizard shell ---------------------------------------------------------
 let wiz = { clip:null };
 let step = 1;
-function openWiz(){ step=1; if(document.getElementById('camera').options.length<=1) loadCameras(); showStep(); document.getElementById('modal').style.display='flex'; }
+function openWiz(){
+  // Fresh case: clear anything left over from a previous add/edit session.
+  wiz.clip = null;
+  for(const id of ['clip','name','description','presence','region','after','before'])
+    document.getElementById(id).value = '';
+  document.getElementById('expect').value = 'detect';
+  document.getElementById('mode').value = 'background';
+  document.getElementById('fps').value = '2.0';
+  document.getElementById('persist').value = '6';
+  clearRegion(); renderWatch();
+  step=1;
+  if(document.getElementById('camera').options.length<=1) loadCameras();
+  showStep();
+  document.getElementById('modal').style.display='flex';
+}
 function closeWiz(){ document.getElementById('modal').style.display='none'; }
 function showStep(){
   document.querySelectorAll('.wizstep').forEach(el =>
@@ -722,8 +775,8 @@ function showStep(){
 }
 function wizBack(){ if(step>1){ step--; showStep(); } }
 function wizNext(){
-  if(step===1 && !wiz.clip && !sceneVal()){
-    wizMsg('pull, upload, or reference a clip first (or enter a synthetic scene)'); return; }
+  if(step===1 && !wiz.clip){
+    wizMsg('pull, upload, or reference a clip first'); return; }
   if(step===2 && !document.getElementById('name').value.trim()){
     wizMsg('give the case a name'); return; }
   if(step<3){ step++; showStep(); }
@@ -814,7 +867,13 @@ function initDrawer(){
   c.addEventListener('pointerdown', e => { if(drawMode){ drawStart = _pt(e); } });
   c.addEventListener('pointermove', e => { if(drawMode && drawStart){ _drawRect(drawStart, _pt(e), false); } });
   c.addEventListener('pointerup',  e => { if(drawMode && drawStart){ commitRegion(drawStart, _pt(e)); drawStart = null; } });
-  document.getElementById('rvid').addEventListener('loadeddata', syncCanvas);
+  const v = document.getElementById('rvid');
+  v.addEventListener('loadeddata', syncCanvas);
+  // Live readout in the same clip-time units the presence/window fields use.
+  v.addEventListener('timeupdate', () => {
+    document.getElementById('vidTime').textContent =
+      `video at ${fmtTime(v.currentTime)}`;
+  });
   window.addEventListener('resize', () => { if(step===2) syncCanvas(); });
 }
 
@@ -892,9 +951,9 @@ async function makeClip(){
   // and suggest person-gated mode, the mode that ground truth exists for.
   if(res.presence && res.presence.length){
     document.getElementById('presence').value =
-      res.presence.map(w => `${w[0]}-${w[1]}`).join(', ');
+      res.presence.map(w => `${fmtTime(w[0])}-${fmtTime(w[1])}`).join(', ');
     document.getElementById('mode').value = 'person_gated';
-    wizMsg(`clip ready — person detected at ${res.presence.map(w=>w[0]+'–'+w[1]+'s').join(', ')}; watch below, then Next`);
+    wizMsg(`clip ready — person in frame at ${res.presence.map(w=>fmtTime(w[0])+'–'+fmtTime(w[1])).join(', ')}; watch below, then Next`);
   } else {
     wizMsg('clip ready — watch it below to confirm, then Next'
       + (res.presence_error ? ` (person events unavailable: ${res.presence_error})` : ''));
@@ -912,13 +971,10 @@ async function uploadClip(){
   setClip(res.clip); wizMsg('uploaded — watch it below to confirm, then Next');
 }
 function refClip(){ const v = document.getElementById('clip').value.trim(); if(v) setClip(v); }
-function onScene(){ wiz.clip = null; renderWatch(); }
-function sceneVal(){ return document.getElementById('scene').value.trim(); }
 
 function setClip(path){
   wiz.clip = path;
   document.getElementById('clip').value = path;
-  document.getElementById('scene').value = '';
   renderWatch();
 }
 function renderWatch(){
@@ -927,29 +983,40 @@ function renderWatch(){
     el.innerHTML = `<div class="muted">Source clip — watch to confirm it's the right footage:</div>
       <video controls preload="metadata" src="${encodeURI(wiz.clip)}"></video>
       <div class="muted">${wiz.clip}</div>`;
-  } else if(sceneVal()){
-    el.innerHTML = `<div class="muted">Synthetic scene — nothing to watch; verify on step 3.</div>`;
   } else {
     el.innerHTML = `<div class="muted">No source chosen yet.</div>`;
   }
 }
 
 // ---- expectation + verify + save ------------------------------------------
+// Times are shown mm:ss to match the video scrubber, stored as seconds.
+function parseTime(s){
+  s = (s||'').trim();
+  if(!s) return null;
+  const parts = s.split(':').map(Number);
+  if(parts.some(isNaN)) return null;
+  return parts.reduce((acc, p) => acc * 60 + p, 0);
+}
+function fmtTime(sec){
+  const m = Math.floor(sec / 60), s = sec - m * 60;
+  const whole = Math.floor(s), tenth = Math.round((s - whole) * 10);
+  return `${m}:${String(whole).padStart(2,'0')}` + (tenth ? `.${tenth}` : '');
+}
+
 function parsePresence(text){
-  // "8-14, 22.5-25" -> [[8,14],[22.5,25]]; null when empty/invalid.
+  // "2:19.5-2:36, 8-14" -> [[139.5,156],[8,14]]; null when empty/invalid.
   const windows = [];
   for(const part of text.split(',')){
-    const m = part.trim().match(/^([\\d.]+)\\s*[-–]\\s*([\\d.]+)$/);
-    if(!m) continue;
-    const a = parseFloat(m[1]), b = parseFloat(m[2]);
-    if(!isNaN(a) && !isNaN(b) && b > a) windows.push([a, b]);
+    const halves = part.trim().split(/\\s*[-–]\\s*/);
+    if(halves.length !== 2) continue;
+    const a = parseTime(halves[0]), b = parseTime(halves[1]);
+    if(a != null && b != null && b > a) windows.push([a, b]);
   }
   return windows.length ? windows : null;
 }
 
 function formCase(){
   const region = document.getElementById('region').value.trim();
-  const scene = sceneVal();
   const mode = document.getElementById('mode').value;
   const det = { persist_samples: parseInt(document.getElementById('persist').value||'6') };
   if(mode !== 'background') det.mode = mode;
@@ -958,13 +1025,12 @@ function formCase(){
     expect: document.getElementById('expect').value,
     description: document.getElementById('description').value,
     clip: (wiz.clip || document.getElementById('clip').value) || null,
-    scene: scene ? JSON.parse(scene) : null,
     fps: parseFloat(document.getElementById('fps').value||'2'),
     detector: det,
     region: region ? region.split(/\\s+/).map(Number) : null,
     presence: parsePresence(document.getElementById('presence').value),
-    after: document.getElementById('after').value || null,
-    before: document.getElementById('before').value || null,
+    after: parseTime(document.getElementById('after').value),
+    before: parseTime(document.getElementById('before').value),
   };
 }
 
