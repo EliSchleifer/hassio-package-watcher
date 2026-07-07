@@ -228,6 +228,9 @@ def test_preview_case_reports_detection_image(client):
     assert r.status_code == 200
     assert body["passed"] is True and body["detections"]
     assert body["images"]["detection"].startswith("data:image/png;base64,")
+    # the shown frame is the detection that matched the expectation
+    assert body["matched"] is True
+    assert body["detection_time"] is not None
 
 
 def test_preview_case_overlays_expected_region(client):

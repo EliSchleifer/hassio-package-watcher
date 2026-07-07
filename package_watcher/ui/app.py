@@ -276,10 +276,22 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
             return jsonify({"error": f"clip not found: {exc}"}), 400
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 500
-        frames = outcome.result.frames_for_preview
-        det = frames.get("detection")
-        if det is None:
-            det = frames.get("first")
+        res = outcome.result
+        frames = res.frames_for_preview
+        dets = res.detections
+        # Prefer the detection that actually satisfied the expectation, so the
+        # image matches the verdict (not just the first, noisy detection).
+        mi = outcome.matched_index
+        if mi is not None and mi < len(res.det_frames):
+            det = res.det_frames[mi]
+            mask = res.det_masks[mi]
+            det_t = dets[mi].t
+        else:
+            det = frames.get("detection")
+            if det is None:
+                det = frames.get("first")
+            mask = frames.get("mask")
+            det_t = dets[0].t if dets else None
         # Overlay the expected region (cyan) next to the detector's own box
         # (green) so "right thing, right place?" is answerable at a glance.
         if det is not None and case.region is not None:
@@ -289,12 +301,12 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
             cv2.rectangle(det, (int(rx * dw), int(ry * dh)),
                           (int((rx + rw) * dw), int((ry + rh) * dh)),
                           (255, 200, 0), 2)
-        dets = outcome.result.detections
         return jsonify({
             "passed": outcome.passed,
             "reason": outcome.reason,
             "expect": case.expect,
-            "detection_time": round(dets[0].t, 1) if dets else None,
+            "detection_time": round(det_t, 1) if det_t is not None else None,
+            "matched": mi is not None,
             "detections": [
                 {"t": round(d.t, 1),
                  "bbox": [round(v, 3) for v in d.bbox_norm],
@@ -302,7 +314,7 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
                 for d in dets],
             "images": {
                 "detection": _png_data_uri(det),
-                "mask": _png_data_uri(frames.get("mask")),
+                "mask": _png_data_uri(mask),
             },
         })
 
@@ -912,9 +924,11 @@ async function verify(){
   const mark = res.passed ? '✓ grades as you expect' : '✗ does NOT grade as expected';
   const all = res.detections || [];
   const n = all.length;
-  const cap = res.detection_time != null
-    ? `frame at first detection (t=${res.detection_time}s)`
-    : 'no detection — showing first frame';
+  const cap = res.detection_time == null
+    ? 'no detection — showing first frame'
+    : res.matched
+      ? `frame at the matching detection (t=${res.detection_time}s)`
+      : `frame at first detection (t=${res.detection_time}s)`;
   // Show the first few detections, then summarize the rest.
   const shown = all.slice(0, 5).map(d =>
     `t=${d.t}s · (${d.bbox.join(', ')}) · conf=${d.confidence}`).join('<br>');

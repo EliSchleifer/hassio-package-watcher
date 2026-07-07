@@ -64,6 +64,11 @@ class ClipResult:
     samples: int
     scene_resets: int
     frames_for_preview: dict[str, np.ndarray] = field(default_factory=dict)
+    # Annotated frame + mask per detection (aligned with `detections`), only
+    # populated when capture_preview=True. Lets the UI show the frame of the
+    # detection that actually matched the expectation, not just the first.
+    det_frames: list[np.ndarray] = field(default_factory=list)
+    det_masks: list[np.ndarray] = field(default_factory=list)
 
 
 @dataclass
@@ -72,6 +77,8 @@ class CaseOutcome:
     result: ClipResult
     passed: bool
     reason: str
+    matched_index: Optional[int] = None  # index into result.detections that
+                                          # satisfied a "detect" expectation
 
 
 _VALID_DETECTOR_FIELDS = set(DetectorConfig.__dataclass_fields__)
@@ -145,6 +152,8 @@ def run_case(case: FixtureCase, fixtures_dir: str = ".",
     cfg = DetectorConfig(**case.detector)
     detector = StaticObjectDetector(cfg, zone=case.zone)
     detections: list[Detection] = []
+    det_frames: list[np.ndarray] = []
+    det_masks: list[np.ndarray] = []
     samples = 0
     preview: dict[str, np.ndarray] = {}
     first_frame: Optional[np.ndarray] = None
@@ -158,10 +167,14 @@ def run_case(case: FixtureCase, fixtures_dir: str = ".",
                 t=report.reported_at, bbox_norm=report.bbox_norm,
                 confidence=report.confidence, triggered=report.triggered,
                 candidate_id=report.candidate_id))
-            if capture_preview and "detection" not in preview:
-                preview["detection"] = _annotate(report)
-                preview["baseline"] = report.baseline
-                preview["mask"] = report.mask
+            if capture_preview:
+                annotated = _annotate(report)
+                det_frames.append(annotated)
+                det_masks.append(report.mask)
+                if "detection" not in preview:
+                    preview["detection"] = annotated
+                    preview["baseline"] = report.baseline
+                    preview["mask"] = report.mask
         samples += 1
 
     if capture_preview:
@@ -169,7 +182,8 @@ def run_case(case: FixtureCase, fixtures_dir: str = ".",
             preview.setdefault("first", first_frame)
     return ClipResult(case=case, detections=detections, samples=samples,
                       scene_resets=detector.scene_resets,
-                      frames_for_preview=preview)
+                      frames_for_preview=preview,
+                      det_frames=det_frames, det_masks=det_masks)
 
 
 def _annotate(report: NewObjectReport) -> np.ndarray:
@@ -204,8 +218,10 @@ def evaluate(result: ClipResult) -> CaseOutcome:
     case = result.case
     dets = result.detections
 
-    def outcome(passed: bool, reason: str) -> CaseOutcome:
-        return CaseOutcome(case=case, result=result, passed=passed, reason=reason)
+    def outcome(passed: bool, reason: str,
+                matched: Optional[int] = None) -> CaseOutcome:
+        return CaseOutcome(case=case, result=result, passed=passed,
+                           reason=reason, matched_index=matched)
 
     if case.expect == "no_detect":
         if dets:
@@ -248,9 +264,10 @@ def evaluate(result: ClipResult) -> CaseOutcome:
         matching = timed
 
     d = matching[0]
+    matched_idx = next(i for i, x in enumerate(dets) if x is d)
     return outcome(
         True, f"detected at t={d.t:.1f}s, region={_fmt(d.bbox_norm)}, "
-              f"confidence={d.confidence:.2f}")
+              f"confidence={d.confidence:.2f}", matched=matched_idx)
 
 
 def _fmt(bbox) -> str:
