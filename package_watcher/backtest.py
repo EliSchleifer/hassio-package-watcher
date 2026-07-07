@@ -301,8 +301,13 @@ def run_backtest(snapshot_fn: SnapshotFn,
 
 
 def protect_snapshot_fn(unifi: UnifiConfig, camera_id: str,
-                        width: int = 640) -> SnapshotFn:
-    """A SnapshotFn backed by the Protect NVR (warm persistent session)."""
+                        width: Optional[int] = None) -> SnapshotFn:
+    """A SnapshotFn backed by the Protect NVR (warm persistent session).
+
+    width=None requests the camera's NATIVE resolution: backtesting is
+    cron-cadence work, so quality beats latency. The detector downsizes
+    internally for the diff math; crops for the vision model, evidence, and
+    the before/after display all keep the full-resolution pixels."""
     from .ui import protect
 
     def fn(at: datetime):

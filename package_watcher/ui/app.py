@@ -555,9 +555,11 @@ def _group_jpg(frame, bboxes) -> Optional[str]:
         cv2.rectangle(img, (x, y), (x + w, y + h), (60, 220, 60), th)
         cv2.putText(img, str(i), (x, max(18, y - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 220, 60), th)
-    scale = 480 / img.shape[1]
+    # Cards are ~400px wide but frames are now native-res: 800 keeps zooming
+    # useful without shipping multi-MB data URIs per card.
+    scale = 800 / img.shape[1]
     if scale < 1:
-        img = cv2.resize(img, (480, int(img.shape[0] * scale)),
+        img = cv2.resize(img, (800, int(img.shape[0] * scale)),
                          interpolation=cv2.INTER_AREA)
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
     return ("data:image/jpeg;base64," +
@@ -1430,7 +1432,8 @@ async function openZone(){
   img.onerror = () => msg('btStatus',
     'could not fetch a live snapshot from this camera — is Protect reachable?');
   // No `at` = live view; recorded footage at "now" doesn't exist yet.
-  img.src = `api/snapshot?camera_id=${encodeURIComponent(cam)}&width=640&t=${Date.now()}`;
+  // Single fetch, so ask for real pixels — zone edges deserve them.
+  img.src = `api/snapshot?camera_id=${encodeURIComponent(cam)}&width=1600&t=${Date.now()}`;
   const res = await j(`api/zone?camera_id=${encodeURIComponent(cam)}`);
   zonePoly = res.zone || null;
   updateZoneInfo(); syncZoneCanvas(); drawZone();
