@@ -197,6 +197,104 @@ def test_snapshot_returns_jpeg(client, monkeypatch):
     assert captured["dt"].year == 2026
 
 
+def test_snapshot_without_at_means_live(client, monkeypatch):
+    from package_watcher.ui import hass, protect
+    from package_watcher.config import UnifiConfig
+
+    monkeypatch.setattr(hass, "discover_unifi_protect",
+                        lambda: UnifiConfig(host="10.0.0.5", api_key="k"))
+    monkeypatch.setattr(protect, "available", lambda: True)
+    seen = {}
+
+    def fake_snap(cfg, cam, dt, width=640):
+        seen["dt"] = dt
+        return b"\xff\xd8live"
+
+    monkeypatch.setattr(protect, "snapshot_at", fake_snap)
+    c, _ = client
+    r = c.get("/api/snapshot?camera_id=abc")
+    assert r.status_code == 200 and seen["dt"] is None
+
+
+def test_zone_roundtrip_and_config_pickup(client, tmp_path, monkeypatch):
+    """Zone saved in the UI lands in zones.yaml, is returned by GET, keyed
+    by id AND name, and load_config picks it up from the config space."""
+    c, fixtures = client
+    r = c.post("/api/zone", json={"camera_id": "cam123",
+                                  "camera_name": "Front Door",
+                                  "rect": [0.2, 0.5, 0.4, 0.3]})
+    assert r.status_code == 200
+    poly = r.get_json()["zone"]
+    assert poly[0] == [0.2, 0.5] and poly[2] == [0.6000000000000001, 0.8]
+
+    got = c.get("/api/zone?camera_id=cam123").get_json()
+    assert got["zone"] == poly
+
+    # zones.yaml sits in the fixtures dir here (no config passed) and is
+    # keyed by both id and display name.
+    import yaml as _yaml
+    zones = _yaml.safe_load((fixtures / "zones.yaml").read_text())
+    assert "cam123" in zones and "Front Door" in zones
+
+    # A config file next to a zones.yaml picks the zones up.
+    (tmp_path / "config.yaml").write_text(
+        "cameras: [{name: front, source: x}]\n")
+    (tmp_path / "zones.yaml").write_text(
+        _yaml.safe_dump({"Front Door": poly}))
+    from package_watcher.config import load_config
+    cfg = load_config(str(tmp_path / "config.yaml"))
+    assert cfg.zones["Front Door"] == poly
+
+    # Clearing removes both keys.
+    c.post("/api/zone", json={"camera_id": "cam123",
+                              "camera_name": "Front Door", "rect": None})
+    assert c.get("/api/zone?camera_id=cam123").get_json()["zone"] is None
+
+
+def test_zone_accepts_full_polygon(client):
+    c, _ = client
+    tri = [[0.1, 0.9], [0.5, 0.4], [0.9, 0.9]]
+    r = c.post("/api/zone", json={"camera_id": "camT", "poly": tri})
+    assert r.status_code == 200
+    assert c.get("/api/zone?camera_id=camT").get_json()["zone"] == tri
+    # fewer than 3 points is rejected
+    r2 = c.post("/api/zone", json={"camera_id": "camT",
+                                   "poly": [[0, 0], [1, 1]]})
+    assert r2.status_code == 400
+
+
+def test_protect_zone_import_endpoint(client, monkeypatch):
+    from package_watcher.ui import hass, protect
+    from package_watcher.config import UnifiConfig
+
+    monkeypatch.setattr(hass, "discover_unifi_protect",
+                        lambda: UnifiConfig(host="10.0.0.5", api_key="k"))
+    monkeypatch.setattr(protect, "available", lambda: True)
+    monkeypatch.setattr(protect, "camera_zones", lambda cfg, cam: [
+        {"name": "Porch", "kind": "smart",
+         "points": [[0.1, 0.5], [0.9, 0.5], [0.9, 1.0], [0.1, 1.0]]}])
+    c, _ = client
+    body = c.get("/api/zone/protect?camera_id=abc").get_json()
+    assert body["zones"][0]["name"] == "Porch"
+    assert len(body["zones"][0]["points"]) == 4
+
+
+def test_live_worker_resolves_zone_via_camera_map(tmp_path):
+    from package_watcher.config import (AppConfig, CameraConfig, SinkConfig,
+                                        UnifiConfig)
+    from package_watcher.service import WatcherService
+
+    poly = [[0.2, 0.5], [0.6, 0.5], [0.6, 0.8], [0.2, 0.8]]
+    cfg = AppConfig(
+        cameras=[CameraConfig(name="front", source="dummy://")],
+        unifi=UnifiConfig(host="h", camera_map={"front": "Front Door"}),
+        sinks=SinkConfig(stdout=False),
+        zones={"Front Door": poly})
+    svc = WatcherService(cfg)
+    worker = svc.workers["front"]
+    assert worker.detector._zone_norm == [tuple(p) for p in poly]
+
+
 def test_snapshot_requires_protect(client, monkeypatch):
     from package_watcher.ui import hass
     monkeypatch.setattr(hass, "discover_unifi_protect", lambda: None)

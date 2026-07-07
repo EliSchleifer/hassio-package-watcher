@@ -47,6 +47,10 @@ class Hit:
     confidence: float                          # CV heuristic
     frame: np.ndarray = field(repr=False)      # native frame at the hit
     crop: np.ndarray = field(repr=False)       # margined crop for the model
+    # The comparison pair: this hit exists because `frame` differed from
+    # `baseline` (the previous person-free snapshot, taken at baseline_at).
+    baseline: Optional[np.ndarray] = field(default=None, repr=False)
+    baseline_at: Optional[datetime] = None
     verification: Optional[dict[str, Any]] = None
 
 
@@ -138,6 +142,7 @@ def run_backtest(snapshot_fn: SnapshotFn,
     result.samples_total = len(times)
 
     prev_frame: Optional[np.ndarray] = None
+    prev_at: Optional[datetime] = None
     for i, at in enumerate(times):
         if progress:
             progress(i, len(times))
@@ -171,6 +176,7 @@ def run_backtest(snapshot_fn: SnapshotFn,
                 hit = Hit(
                     at=at, bbox=report.bbox, bbox_norm=report.bbox_norm,
                     confidence=report.confidence, frame=frame, crop=crop,
+                    baseline=prev_frame, baseline_at=prev_at,
                     verification=verdict)
                 result.hits.append(hit)
                 if on_hit:
@@ -178,6 +184,7 @@ def run_backtest(snapshot_fn: SnapshotFn,
         # The current person-free sample becomes the next baseline whether or
         # not anything was found — arrivals report once, then join the scene.
         prev_frame = frame
+        prev_at = at
 
     if progress:
         progress(len(times), len(times))

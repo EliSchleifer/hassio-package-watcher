@@ -91,6 +91,10 @@ class AppConfig:
     verifier: VerifierConfig = field(default_factory=VerifierConfig)
     sinks: SinkConfig = field(default_factory=SinkConfig)
     events_dir: str = "./events"
+    # Per-camera watch zones (normalized polygons), keyed by Protect camera
+    # id and/or display name. Maintained by the UI's zone drawer in
+    # zones.yaml next to the config file; an inline `zones:` block wins.
+    zones: dict[str, Any] = field(default_factory=dict)
 
 
 def _dataclass_from(cls, data: dict[str, Any]):
@@ -125,6 +129,15 @@ def load_config(path: str, require_cameras: bool = True) -> AppConfig:
     verifier = _dataclass_from(VerifierConfig, raw.get("verifier") or {})
     sinks = _dataclass_from(SinkConfig, raw.get("sinks") or {})
 
+    # Watch zones: zones.yaml next to the config file (written by the UI's
+    # zone drawer), overridden by an inline `zones:` block.
+    zones: dict[str, Any] = {}
+    sibling = os.path.join(os.path.dirname(os.path.abspath(path)), "zones.yaml")
+    if os.path.isfile(sibling):
+        with open(sibling, "r", encoding="utf-8") as f:
+            zones.update(yaml.safe_load(f) or {})
+    zones.update(raw.get("zones") or {})
+
     return AppConfig(
         cameras=cameras,
         detector=detector,
@@ -132,4 +145,5 @@ def load_config(path: str, require_cameras: bool = True) -> AppConfig:
         verifier=verifier,
         sinks=sinks,
         events_dir=raw.get("events_dir", "./events"),
+        zones=zones,
     )

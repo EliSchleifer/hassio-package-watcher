@@ -123,13 +123,16 @@ def main(argv: list[str] | None = None) -> int:
         cfg_path = args.config or "config.yaml"
         if args.setup:
             _setup_unifi(cfg_path)
-        unifi = verifier = None
+        unifi = verifier = zones_path = None
         if os.path.isfile(cfg_path):
             cfg = load_config(cfg_path, require_cameras=False)
             unifi, verifier = cfg.unifi, cfg.verifier
+            # Zones live next to the config so the live watcher sees them.
+            zones_path = os.path.join(
+                os.path.dirname(os.path.abspath(cfg_path)), "zones.yaml")
         serve(fixtures_dir=args.fixtures, unifi=unifi,
               host=args.host, port=args.port, reload=args.reload,
-              verifier_cfg=verifier)
+              verifier_cfg=verifier, zones_path=zones_path)
         return 0
 
     if args.command == "run":

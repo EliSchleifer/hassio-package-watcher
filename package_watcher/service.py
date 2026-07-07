@@ -28,7 +28,18 @@ class CameraWorker:
     def __init__(self, cam: CameraConfig, app: "WatcherService"):
         self.cam = cam
         self.app = app
-        self.detector = build_detector(app.config.detector, zone=cam.zone)
+        # Zone precedence: explicit per-camera zone in config, else the
+        # zone drawn in the UI (config.zones, keyed by Protect display name
+        # via camera_map, or by the watcher camera name directly).
+        zone = cam.zone
+        if zone is None and app.config.zones:
+            protect_name = (app.config.unifi.camera_map.get(cam.name)
+                            if app.config.unifi else None)
+            z = (app.config.zones.get(protect_name)
+                 if protect_name else None) or app.config.zones.get(cam.name)
+            if z:
+                zone = [tuple(p) for p in z]
+        self.detector = build_detector(app.config.detector, zone=zone)
         self._gated = app.config.detector.mode == "person_gated"
         self.source = FrameSource(cam.name, cam.source, cam.sample_fps)
         self.attention_until = 0.0

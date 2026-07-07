@@ -96,8 +96,8 @@ class _Session:
         self._client, self._key = client, key
         return client
 
-    def snapshot(self, cfg: UnifiConfig, camera_id: str, dt: datetime,
-                 width: int) -> Optional[bytes]:
+    def snapshot(self, cfg: UnifiConfig, camera_id: str,
+                 dt: Optional[datetime], width: int) -> Optional[bytes]:
         with self._lock:
             loop = self._ensure_loop()
 
@@ -120,9 +120,11 @@ class _Session:
 _session = _Session()
 
 
-def snapshot_at(cfg: UnifiConfig, camera_id: str, dt: datetime,
+def snapshot_at(cfg: UnifiConfig, camera_id: str, dt: Optional[datetime],
                 width: int = 640) -> Optional[bytes]:
-    """One historical frame at ``dt`` — fast enough to drive a scrubber."""
+    """One frame at ``dt`` (or the LIVE view when dt is None) — fast enough
+    to drive a scrubber. Recorded footage at "now" does not exist yet on the
+    NVR, so callers wanting the current view must pass None."""
     return _session.snapshot(cfg, camera_id, dt, width)
 
 
@@ -152,6 +154,25 @@ def _events_to_windows(events, camera_id: str, start: datetime,
         else:
             merged.append((a, b))
     return merged
+
+
+def camera_zones(cfg: UnifiConfig, camera_id: str) -> list[dict[str, Any]]:
+    """The zones already configured on the camera in UniFi Protect
+    (smart-detection and motion zones), as normalized polygons — so a watch
+    zone can be imported instead of drawn."""
+    async def _fn(client):
+        cam = client.bootstrap.cameras.get(camera_id)
+        if cam is None:
+            raise ValueError(f"no Protect camera with id {camera_id!r}")
+        out = []
+        for kind, zones in (("smart", cam.smart_detect_zones or []),
+                            ("motion", cam.motion_zones or [])):
+            for z in zones:
+                pts = [[float(x), float(y)] for x, y in (z.points or [])]
+                if len(pts) >= 3:
+                    out.append({"name": z.name, "kind": kind, "points": pts})
+        return out
+    return asyncio.run(_with_client(cfg, _fn))
 
 
 def person_windows(cfg: UnifiConfig, camera_id: str, start: datetime,
