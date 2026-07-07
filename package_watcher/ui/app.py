@@ -227,7 +227,18 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
             protect.pull_clip(u, data["camera_id"], start, end, out)
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 500
-        return jsonify({"clip": f"clips/{fname}"})
+        # Also fetch person smart-detect windows for the same range, so the
+        # clip arrives pre-labeled for person-gated mode. Best-effort: a
+        # failure here must not lose the clip we just pulled.
+        presence: list = []
+        presence_error = None
+        try:
+            presence = protect.person_windows(u, data["camera_id"], start, end)
+        except Exception as exc:  # noqa: BLE001
+            presence_error = str(exc)
+        return jsonify({"clip": f"clips/{fname}", "presence": presence,
+                        **({"presence_error": presence_error}
+                           if presence_error else {})})
 
     @app.post("/api/upload")
     def api_upload() -> Any:
@@ -269,6 +280,8 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
             entry["region"] = tuple(entry["region"])
         if "zone" in entry:
             entry["zone"] = [tuple(pt) for pt in entry["zone"]]
+        if "presence" in entry:
+            entry["presence"] = [tuple(w) for w in entry["presence"]]
         case = FixtureCase(**entry)
         try:
             outcome = run_and_evaluate(case, fixtures_dir, capture_preview=True)
@@ -371,12 +384,16 @@ def _case_from_form(data: dict[str, Any]) -> dict[str, Any]:
         case["before"] = float(data["before"])
     if data.get("zone"):
         case["zone"] = [[float(a), float(b)] for a, b in data["zone"]]
+    if data.get("presence"):
+        case["presence"] = [[float(a), float(b)] for a, b in data["presence"]]
     # Validate it constructs before we persist it.
     entry = dict(case)
     if "region" in entry:
         entry["region"] = tuple(entry["region"])
     if "zone" in entry:
         entry["zone"] = [tuple(pt) for pt in entry["zone"]]
+    if "presence" in entry:
+        entry["presence"] = [tuple(w) for w in entry["presence"]]
     FixtureCase(**entry)
     return case
 
@@ -580,8 +597,20 @@ _PAGE = """<!doctype html>
     </div>
     <label>Description</label><input id="description">
     <div class="row">
+      <div><label>Detection mode</label>
+        <select id="mode">
+          <option value="background">background — continuous watch</option>
+          <option value="person_gated">person-gated — compare before/after visits</option>
+        </select></div>
       <div><label>fps</label><input id="fps" value="2.0"></div>
       <div><label>persist_samples</label><input id="persist" value="6"></div>
+    </div>
+    <div id="presenceRow">
+      <label>Person present (seconds, e.g. <code>8-14, 22-25</code>)</label>
+      <input id="presence" placeholder="auto-filled from Protect when pulling a clip">
+      <div class="muted">Person-gated mode ignores everything while a person is
+        in frame and compares the clean scene after each visit against the
+        clean scene before it.</div>
     </div>
 
     <div id="regionDrawer">
@@ -858,7 +887,18 @@ async function makeClip(){
   const res = await j('api/pull', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({camera_id: scrub.cam, start: atIso(scrub.inS), end: atIso(scrub.outS)})});
   if(res.error){ wizMsg('pull failed: '+res.error); return; }
-  setClip(res.clip); wizMsg('clip ready — watch it below to confirm, then Next');
+  setClip(res.clip);
+  // Protect also tells us when a person was in frame — pre-label the case
+  // and suggest person-gated mode, the mode that ground truth exists for.
+  if(res.presence && res.presence.length){
+    document.getElementById('presence').value =
+      res.presence.map(w => `${w[0]}-${w[1]}`).join(', ');
+    document.getElementById('mode').value = 'person_gated';
+    wizMsg(`clip ready — person detected at ${res.presence.map(w=>w[0]+'–'+w[1]+'s').join(', ')}; watch below, then Next`);
+  } else {
+    wizMsg('clip ready — watch it below to confirm, then Next'
+      + (res.presence_error ? ` (person events unavailable: ${res.presence_error})` : ''));
+  }
 }
 
 // ---- source: upload / reference / synthetic -------------------------------
@@ -895,9 +935,24 @@ function renderWatch(){
 }
 
 // ---- expectation + verify + save ------------------------------------------
+function parsePresence(text){
+  // "8-14, 22.5-25" -> [[8,14],[22.5,25]]; null when empty/invalid.
+  const windows = [];
+  for(const part of text.split(',')){
+    const m = part.trim().match(/^([\\d.]+)\\s*[-–]\\s*([\\d.]+)$/);
+    if(!m) continue;
+    const a = parseFloat(m[1]), b = parseFloat(m[2]);
+    if(!isNaN(a) && !isNaN(b) && b > a) windows.push([a, b]);
+  }
+  return windows.length ? windows : null;
+}
+
 function formCase(){
   const region = document.getElementById('region').value.trim();
   const scene = sceneVal();
+  const mode = document.getElementById('mode').value;
+  const det = { persist_samples: parseInt(document.getElementById('persist').value||'6') };
+  if(mode !== 'background') det.mode = mode;
   return {
     name: document.getElementById('name').value,
     expect: document.getElementById('expect').value,
@@ -905,8 +960,9 @@ function formCase(){
     clip: (wiz.clip || document.getElementById('clip').value) || null,
     scene: scene ? JSON.parse(scene) : null,
     fps: parseFloat(document.getElementById('fps').value||'2'),
-    detector: { persist_samples: parseInt(document.getElementById('persist').value||'6') },
+    detector: det,
     region: region ? region.split(/\\s+/).map(Number) : null,
+    presence: parsePresence(document.getElementById('presence').value),
     after: document.getElementById('after').value || null,
     before: document.getElementById('before').value || null,
   };

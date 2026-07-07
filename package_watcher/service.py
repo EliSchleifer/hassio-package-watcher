@@ -16,7 +16,7 @@ import numpy as np
 
 from .camera import FrameSource
 from .config import AppConfig, CameraConfig
-from .detector import StaticObjectDetector
+from .detector import build_detector
 from .events import TriggerInfo, build_event
 from .evidence import write_evidence
 from .sinks import EventSinks
@@ -28,26 +28,41 @@ class CameraWorker:
     def __init__(self, cam: CameraConfig, app: "WatcherService"):
         self.cam = cam
         self.app = app
-        self.detector = StaticObjectDetector(app.config.detector, zone=cam.zone)
+        self.detector = build_detector(app.config.detector, zone=cam.zone)
+        self._gated = app.config.detector.mode == "person_gated"
         self.source = FrameSource(cam.name, cam.source, cam.sample_fps)
         self.attention_until = 0.0
+        self.person_until = 0.0
         self.last_trigger: TriggerInfo | None = None
         self._lock = threading.Lock()
 
-    def notify_trigger(self, kind: str, source: str, ts: float) -> None:
-        window = (self.app.config.unifi.attention_seconds
-                  if self.app.config.unifi else 120.0)
+    def notify_trigger(self, kind: str, source: str, ts: float,
+                       end_ts: float | None = None) -> None:
+        unifi = self.app.config.unifi
+        window = unifi.attention_seconds if unifi else 120.0
         with self._lock:
             self.attention_until = max(self.attention_until, ts + window)
             self.last_trigger = TriggerInfo(kind=kind, source=source, at=ts)
+            if kind.lower() == "person":
+                # Person presence for gated mode: hold from the event's end
+                # (or from now while it is still ongoing); each websocket
+                # update refreshes the hold.
+                hold = unifi.presence_hold_seconds if unifi else 10.0
+                anchor = end_ts if end_ts is not None else time.time()
+                self.person_until = max(self.person_until, anchor + hold)
         log.info("[%s] attention window opened by %s trigger (until +%.0fs)",
                  self.cam.name, kind, window)
 
     def on_frame(self, frame: np.ndarray, ts: float) -> None:
         with self._lock:
             attention = ts <= self.attention_until
-            trigger = self.last_trigger if attention else None
-        reports = self.detector.process(frame, ts, attention=attention)
+            person = ts <= self.person_until
+            trigger = self.last_trigger if (attention or person) else None
+        if self._gated:
+            reports = self.detector.process(frame, ts,
+                                            person_present=person)
+        else:
+            reports = self.detector.process(frame, ts, attention=attention)
         for report in reports:
             event = build_event(self.cam.name, report, trigger=trigger)
             try:
@@ -79,12 +94,13 @@ class WatcherService:
         self._trigger_listener = None
 
     def notify_trigger(self, camera: str, kind: str, ts: float,
+                       end_ts: float | None = None,
                        source: str = "unifi-protect") -> None:
         worker = self.workers.get(camera)
         if worker is None:
             log.debug("trigger for unknown camera %r ignored", camera)
             return
-        worker.notify_trigger(kind, source, ts)
+        worker.notify_trigger(kind, source, ts, end_ts=end_ts)
 
     def start(self) -> None:
         if self.config.unifi:

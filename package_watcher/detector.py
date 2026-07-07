@@ -30,6 +30,9 @@ import numpy as np
 
 @dataclass
 class DetectorConfig:
+    mode: str = "background"         # "background": continuous dual-EMA model;
+                                     # "person_gated": compare person-free
+                                     # frames bracketing a person's visit
     resize_width: int = 640          # processing resolution (aspect preserved)
     blur_kernel: int = 5             # gaussian blur to suppress sensor noise
     diff_threshold: int = 18         # grayscale delta considered "different"
@@ -48,6 +51,12 @@ class DetectorConfig:
     heal_after_reported: int = 20    # samples after report before re-arming
     global_change_frac: float = 0.35  # scene-change guard (lights on/off, PTZ)
     match_iou: float = 0.2           # IoU to match a blob to a known candidate
+    # --- person-gated mode only ---
+    settle_samples: int = 3          # person-free, motion-free samples to wait
+                                     # after a visit before comparing
+    idle_ref_alpha: float = 0.05     # reference refresh rate while idle+quiet
+    motion_frac: float = 0.02        # frame-to-frame changed-pixel fraction
+                                     # that counts as "something is moving"
 
 
 @dataclass
@@ -100,22 +109,131 @@ def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
     return inter / float(aw * ah + bw * bh - inter)
 
 
-class StaticObjectDetector:
-    """Per-camera detector. Feed it sampled frames; it returns reports."""
+class _BlobDetectorBase:
+    """Shared frame preparation, zoning, and blob shape-filtering.
+
+    Both detector modes reduce the problem to "find package-shaped blobs in
+    a binary difference mask"; they differ only in how that mask is produced
+    (continuous dual-EMA model vs. person-bracketed comparison)."""
 
     def __init__(self, config: DetectorConfig | None = None,
                  zone: Optional[list[tuple[float, float]]] = None):
         self.cfg = config or DetectorConfig()
         self._zone_norm = zone  # normalized polygon, or None = whole frame
-        self._fast: Optional[np.ndarray] = None
-        self._slow: Optional[np.ndarray] = None
         self._zone_mask: Optional[np.ndarray] = None
         self._proc_size: Optional[tuple[int, int]] = None  # (w, h)
         self._native_size: Optional[tuple[int, int]] = None
-        self._candidates: list[Candidate] = []
         self._ids = itertools.count(1)
         self.samples_seen = 0
         self.scene_resets = 0
+
+    def _reset_models(self) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def _prepare(self, frame_bgr: np.ndarray) -> np.ndarray:
+        h, w = frame_bgr.shape[:2]
+        self._native_size = (w, h)
+        if w > self.cfg.resize_width:
+            scale = self.cfg.resize_width / w
+            frame_bgr = cv2.resize(
+                frame_bgr, (self.cfg.resize_width, max(1, int(round(h * scale)))),
+                interpolation=cv2.INTER_AREA)
+        ph, pw = frame_bgr.shape[:2]
+        if self._proc_size != (pw, ph):
+            self._proc_size = (pw, ph)
+            self._reset_models()  # resolution changed; re-seed
+            self._zone_mask = self._build_zone_mask(pw, ph)
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        k = self.cfg.blur_kernel
+        if k >= 3:
+            gray = cv2.GaussianBlur(gray, (k | 1, k | 1), 0)
+        return gray
+
+    def _build_zone_mask(self, w: int, h: int) -> Optional[np.ndarray]:
+        if not self._zone_norm:
+            return None
+        pts = np.array([[int(x * w), int(y * h)] for x, y in self._zone_norm],
+                       dtype=np.int32)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts], 255)
+        return mask
+
+    def _extract_blobs(self, mask: np.ndarray, diff_slow: np.ndarray
+                       ) -> list[tuple[tuple[int, int, int, int], float, np.ndarray]]:
+        """Return (bbox, contrast, blob_mask) for each plausible blob."""
+        total = mask.shape[0] * mask.shape[1]
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        out = []
+        for i in range(1, n):
+            x, y, w, h, area = stats[i]
+            frac = area / total
+            if frac < self.cfg.min_area_frac or frac > self.cfg.max_area_frac:
+                continue
+            # Shape priors: a package is a compact, roughly square-to-wide
+            # rectangle sitting on a surface. Reject tall upright blobs (a
+            # standing/pausing person, a leg) and wispy outlines that don't
+            # fill their bounding box — the two ways people slip through.
+            if h > w * self.cfg.max_aspect_ratio:
+                continue
+            if area < self.cfg.min_extent * w * h:
+                continue
+            blob = (labels == i)
+            contrast = float(diff_slow[blob].mean()) / 255.0
+            out.append(((int(x), int(y), int(w), int(h)), contrast,
+                        blob.astype(np.uint8) * 255))
+        return out
+
+    def _blob_report(self, *, candidate_id: int,
+                     bbox: tuple[int, int, int, int], contrast: float,
+                     mask: np.ndarray, baseline: np.ndarray,
+                     frame: np.ndarray, first_seen: float, ts: float,
+                     persisted: int, triggered: bool) -> NewObjectReport:
+        pw, ph = self._proc_size
+        nw, nh = self._native_size
+        sx, sy = nw / pw, nh / ph
+        x, y, w, h = bbox
+        native_bbox = (int(round(x * sx)), int(round(y * sy)),
+                       int(round(w * sx)), int(round(h * sy)))
+        area_frac = (w * h) / float(pw * ph)
+        # Confidence heuristic (documented, not learned): persistence is
+        # already satisfied, so blend contrast (how different the region is
+        # from the pre-object background) with a mild size prior that favors
+        # package-sized blobs over specks or half-frame lighting artifacts.
+        size_prior = 1.0 - min(1.0, abs(np.log10(max(area_frac, 1e-6) / 0.01)) / 2.5)
+        confidence = float(np.clip(0.35 + 0.45 * min(1.0, contrast * 4)
+                                   + 0.20 * size_prior, 0.0, 1.0))
+        return NewObjectReport(
+            candidate_id=candidate_id,
+            bbox=native_bbox,
+            bbox_norm=(native_bbox[0] / nw, native_bbox[1] / nh,
+                       native_bbox[2] / nw, native_bbox[3] / nh),
+            frame_size=(nw, nh),
+            area_fraction=area_frac,
+            contrast=contrast,
+            confidence=confidence,
+            first_seen=first_seen,
+            reported_at=ts,
+            samples_persisted=persisted,
+            triggered=triggered,
+            frame=frame,
+            mask=mask,
+            baseline=baseline,
+        )
+
+
+class StaticObjectDetector(_BlobDetectorBase):
+    """Continuous per-camera detector. Feed it sampled frames; it returns
+    reports. Uses the dual fast/slow background model described up top."""
+
+    def __init__(self, config: DetectorConfig | None = None,
+                 zone: Optional[list[tuple[float, float]]] = None):
+        super().__init__(config, zone)
+        self._fast: Optional[np.ndarray] = None
+        self._slow: Optional[np.ndarray] = None
+        self._candidates: list[Candidate] = []
+
+    def _reset_models(self) -> None:
+        self._fast = self._slow = None
 
     # ------------------------------------------------------------------
     def process(self, frame_bgr: np.ndarray, ts: Optional[float] = None,
@@ -169,60 +287,6 @@ class StaticObjectDetector:
         for report in reports:
             report.frame = frame_bgr
         return reports
-
-    # ------------------------------------------------------------------
-    def _prepare(self, frame_bgr: np.ndarray) -> np.ndarray:
-        h, w = frame_bgr.shape[:2]
-        self._native_size = (w, h)
-        if w > self.cfg.resize_width:
-            scale = self.cfg.resize_width / w
-            frame_bgr = cv2.resize(
-                frame_bgr, (self.cfg.resize_width, max(1, int(round(h * scale)))),
-                interpolation=cv2.INTER_AREA)
-        ph, pw = frame_bgr.shape[:2]
-        if self._proc_size != (pw, ph):
-            self._proc_size = (pw, ph)
-            self._fast = self._slow = None  # resolution changed; re-seed
-            self._zone_mask = self._build_zone_mask(pw, ph)
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        k = self.cfg.blur_kernel
-        if k >= 3:
-            gray = cv2.GaussianBlur(gray, (k | 1, k | 1), 0)
-        return gray
-
-    def _build_zone_mask(self, w: int, h: int) -> Optional[np.ndarray]:
-        if not self._zone_norm:
-            return None
-        pts = np.array([[int(x * w), int(y * h)] for x, y in self._zone_norm],
-                       dtype=np.int32)
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask, [pts], 255)
-        return mask
-
-    def _extract_blobs(self, mask: np.ndarray, diff_slow: np.ndarray
-                       ) -> list[tuple[tuple[int, int, int, int], float, np.ndarray]]:
-        """Return (bbox, contrast, blob_mask) for each plausible blob."""
-        total = mask.shape[0] * mask.shape[1]
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        out = []
-        for i in range(1, n):
-            x, y, w, h, area = stats[i]
-            frac = area / total
-            if frac < self.cfg.min_area_frac or frac > self.cfg.max_area_frac:
-                continue
-            # Shape priors: a package is a compact, roughly square-to-wide
-            # rectangle sitting on a surface. Reject tall upright blobs (a
-            # standing/pausing person, a leg) and wispy outlines that don't
-            # fill their bounding box — the two ways people slip through.
-            if h > w * self.cfg.max_aspect_ratio:
-                continue
-            if area < self.cfg.min_extent * w * h:
-                continue
-            blob = (labels == i)
-            contrast = float(diff_slow[blob].mean()) / 255.0
-            out.append(((int(x), int(y), int(w), int(h)), contrast,
-                        blob.astype(np.uint8) * 255))
-        return out
 
     def _track(self, blobs, gray: np.ndarray, ts: float,
                attention: bool) -> list[NewObjectReport]:
@@ -285,34 +349,141 @@ class StaticObjectDetector:
 
     def _make_report(self, cand: Candidate, ts: float,
                      attention: bool) -> NewObjectReport:
-        pw, ph = self._proc_size
-        nw, nh = self._native_size
-        sx, sy = nw / pw, nh / ph
-        x, y, w, h = cand.bbox
-        native_bbox = (int(round(x * sx)), int(round(y * sy)),
-                       int(round(w * sx)), int(round(h * sy)))
-        area_frac = (w * h) / float(pw * ph)
-        # Confidence heuristic (documented, not learned): persistence is
-        # already satisfied, so blend contrast (how different the region is
-        # from the pre-object background) with a mild size prior that favors
-        # package-sized blobs over specks or half-frame lighting artifacts.
-        size_prior = 1.0 - min(1.0, abs(np.log10(max(area_frac, 1e-6) / 0.01)) / 2.5)
-        confidence = float(np.clip(0.35 + 0.45 * min(1.0, cand.contrast * 4)
-                                   + 0.20 * size_prior, 0.0, 1.0))
-        return NewObjectReport(
-            candidate_id=cand.id,
-            bbox=native_bbox,
-            bbox_norm=(native_bbox[0] / nw, native_bbox[1] / nh,
-                       native_bbox[2] / nw, native_bbox[3] / nh),
-            frame_size=(nw, nh),
-            area_fraction=area_frac,
-            contrast=cand.contrast,
-            confidence=confidence,
-            first_seen=cand.first_seen,
-            reported_at=ts,
-            samples_persisted=cand.hits,
-            triggered=attention,
-            frame=np.empty(0),   # filled in by process() with the native frame
+        return self._blob_report(
+            candidate_id=cand.id, bbox=cand.bbox, contrast=cand.contrast,
             mask=cand.mask if cand.mask is not None else np.empty(0),
             baseline=cand.baseline if cand.baseline is not None else np.empty(0),
-        )
+            frame=np.empty(0),   # filled in by process() with the native frame
+            first_seen=cand.first_seen, ts=ts, persisted=cand.hits,
+            triggered=attention)
+
+
+class PersonGatedDetector(_BlobDetectorBase):
+    """Before/after-visit comparison driven by an external person signal.
+
+    The caller says when a person is in frame (Protect/Frigate smart
+    detection live; labeled `presence` windows in fixtures). While the scene
+    is person-free and quiet, a *reference* frame — the ground truth of the
+    empty scene — slowly tracks lighting. The moment a person appears the
+    reference freezes. When they leave and the scene settles, the settled
+    frame is compared against that frozen reference: anything new, static,
+    and package-shaped is reported. The reference then re-seeds from the
+    settled frame, so a second delivery next to the first still fires.
+
+    Compared to the continuous mode this never learns a paused person into
+    the background, and the two frames it compares are person-free and only
+    minutes apart at most — so lighting has barely moved between them. The
+    tradeoff: an object that appears with *no* person signal is never
+    reported.
+    """
+
+    _IDLE, _PERSON, _SETTLE = "idle", "person", "settle"
+
+    def __init__(self, config: DetectorConfig | None = None,
+                 zone: Optional[list[tuple[float, float]]] = None):
+        super().__init__(config, zone)
+        self._ref: Optional[np.ndarray] = None   # float32 empty-scene truth
+        self._prev: Optional[np.ndarray] = None  # last gray, for motion gating
+        self._state = self._IDLE
+        self._settle = 0
+        self._visit_ended: Optional[float] = None
+
+    def _reset_models(self) -> None:
+        self._ref = None
+        self._prev = None
+        self._state = self._IDLE
+        self._settle = 0
+
+    # ------------------------------------------------------------------
+    def process(self, frame_bgr: np.ndarray, ts: Optional[float] = None,
+                person_present: bool = False,
+                attention: bool = False) -> list[NewObjectReport]:
+        """Process one sampled frame. `attention` is accepted for interface
+        parity and ignored — the person signal *is* the attention here."""
+        ts = time.time() if ts is None else ts
+        gray = self._prepare(frame_bgr)
+        self.samples_seen += 1
+
+        if self._ref is None:
+            # Never seed the ground truth with a person in frame.
+            if not person_present:
+                self._ref = gray.astype(np.float32)
+            self._prev = gray
+            return []
+
+        moving = self._moving(gray)
+        self._prev = gray
+
+        if person_present:
+            self._state = self._PERSON  # freeze the reference
+            return []
+
+        if self._state == self._PERSON:  # the person just left
+            self._state = self._SETTLE
+            self._settle = 0
+            self._visit_ended = ts
+
+        if self._state == self._SETTLE:
+            # Require consecutive quiet samples so we never compare while the
+            # visitor is still half out of frame or the door is swinging.
+            self._settle = 0 if moving else self._settle + 1
+            if self._settle < self.cfg.settle_samples:
+                return []
+            reports = self._compare(gray, frame_bgr, ts)
+            # Re-baseline on the settled scene either way: the next visit is
+            # measured against the porch as it is *now*.
+            self._ref = gray.astype(np.float32)
+            self._state = self._IDLE
+            return reports
+
+        # Idle: let the reference track slow lighting change, but only while
+        # nothing is moving, so a passing cat never smears into the truth.
+        if not moving:
+            cv2.accumulateWeighted(gray, self._ref, self.cfg.idle_ref_alpha)
+        return []
+
+    # ------------------------------------------------------------------
+    def _moving(self, gray: np.ndarray) -> bool:
+        delta = cv2.absdiff(gray, self._prev)
+        frac = float(np.count_nonzero(
+            delta > self.cfg.diff_threshold)) / delta.size
+        return frac > self.cfg.motion_frac
+
+    def _compare(self, gray: np.ndarray, frame_bgr: np.ndarray,
+                 ts: float) -> list[NewObjectReport]:
+        ref8 = self._ref.astype(np.uint8)
+        diff = cv2.absdiff(gray, ref8)
+        changed = float(np.count_nonzero(
+            diff > self.cfg.diff_threshold)) / diff.size
+        if changed > self.cfg.global_change_frac:
+            # Lighting flipped during the visit (porch light, dusk): not a
+            # credible object diff. Re-baseline happens in process().
+            self.scene_resets += 1
+            return []
+        mask = (diff > self.cfg.diff_threshold).astype(np.uint8) * 255
+        if self._zone_mask is not None:
+            mask = cv2.bitwise_and(mask, self._zone_mask)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        reports = []
+        for bbox, contrast, blob_mask in self._extract_blobs(mask, diff):
+            reports.append(self._blob_report(
+                candidate_id=next(self._ids), bbox=bbox, contrast=contrast,
+                mask=blob_mask, baseline=ref8.copy(), frame=frame_bgr,
+                first_seen=self._visit_ended if self._visit_ended is not None else ts,
+                ts=ts, persisted=self._settle, triggered=True))
+        return reports
+
+
+def build_detector(config: DetectorConfig | None = None,
+                   zone: Optional[list[tuple[float, float]]] = None):
+    """Instantiate the detector for `config.mode`."""
+    cfg = config or DetectorConfig()
+    if cfg.mode == "person_gated":
+        return PersonGatedDetector(cfg, zone)
+    if cfg.mode == "background":
+        return StaticObjectDetector(cfg, zone)
+    raise ValueError(
+        f"unknown detector mode {cfg.mode!r}; "
+        f"choices: 'background', 'person_gated'")

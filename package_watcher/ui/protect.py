@@ -126,6 +126,50 @@ def snapshot_at(cfg: UnifiConfig, camera_id: str, dt: datetime,
     return _session.snapshot(cfg, camera_id, dt, width)
 
 
+def _events_to_windows(events, camera_id: str, start: datetime,
+                       end: datetime) -> list[tuple[float, float]]:
+    """Reduce Protect events to clip-relative (start_s, end_s) windows for
+    one camera, clamped to [0, clip length]. Pure, for testability."""
+    clip_len = (end - start).total_seconds()
+    windows: list[tuple[float, float]] = []
+    for ev in events:
+        if getattr(ev, "camera_id", None) != camera_id:
+            continue
+        ev_start = getattr(ev, "start", None)
+        if ev_start is None:
+            continue
+        ev_end = getattr(ev, "end", None) or end  # ongoing -> clip end
+        a = max(0.0, (ev_start - start).total_seconds())
+        b = min(clip_len, (ev_end - start).total_seconds())
+        if b > a:
+            windows.append((round(a, 1), round(b, 1)))
+    windows.sort()
+    # Merge overlaps so the UI shows clean, disjoint windows.
+    merged: list[tuple[float, float]] = []
+    for a, b in windows:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def person_windows(cfg: UnifiConfig, camera_id: str, start: datetime,
+                   end: datetime) -> list[tuple[float, float]]:
+    """Person smart-detect windows over [start, end], clip-relative seconds.
+
+    Lets a pulled clip arrive already labeled with when a person was in
+    frame — the ground truth the person-gated detector mode needs."""
+    async def _fn(client):
+        from uiprotect.data.types import EventType, SmartDetectObjectType
+        events = await client.get_events(
+            start=start, end=end,
+            types=[EventType.SMART_DETECT],
+            smart_detect_types=[SmartDetectObjectType.PERSON])
+        return _events_to_windows(events, camera_id, start, end)
+    return asyncio.run(_with_client(cfg, _fn))
+
+
 def pull_clip(cfg: UnifiConfig, camera_id: str, start: datetime,
               end: datetime, output_path: str) -> str:
     """Download recorded footage [start, end] for a camera to output_path."""

@@ -248,6 +248,100 @@ def test_preview_case_overlays_expected_region(client):
     assert "detection_time" in body
 
 
+def test_events_to_windows_filters_clamps_and_merges():
+    from datetime import datetime, timezone
+    from types import SimpleNamespace as E
+    from package_watcher.ui.protect import _events_to_windows
+
+    utc = timezone.utc
+    start = datetime(2026, 7, 5, 15, 0, 0, tzinfo=utc)
+    end = datetime(2026, 7, 5, 15, 1, 0, tzinfo=utc)  # 60s clip
+
+    def dt(s):
+        return datetime(2026, 7, 5, 15, 0, s, tzinfo=utc)
+
+    events = [
+        E(camera_id="cam1", start=dt(8), end=dt(14)),
+        E(camera_id="cam2", start=dt(20), end=dt(30)),        # other camera
+        E(camera_id="cam1", start=dt(12), end=dt(18)),        # overlaps first
+        E(camera_id="cam1", start=dt(50), end=None),          # ongoing -> end
+        E(camera_id="cam1", start=None, end=dt(40)),          # malformed
+    ]
+    windows = _events_to_windows(events, "cam1", start, end)
+    assert windows == [(8.0, 18.0), (50.0, 60.0)]
+
+
+def test_pull_returns_presence_windows(client, monkeypatch):
+    from package_watcher.ui import hass, protect
+    from package_watcher.config import UnifiConfig
+
+    monkeypatch.setattr(hass, "discover_unifi_protect",
+                        lambda: UnifiConfig(host="10.0.0.5", api_key="k"))
+    monkeypatch.setattr(protect, "available", lambda: True)
+    monkeypatch.setattr(protect, "pull_clip",
+                        lambda cfg, cam, s, e, out: out)
+    monkeypatch.setattr(protect, "person_windows",
+                        lambda cfg, cam, s, e: [(8.0, 14.0)])
+    c, _ = client
+    r = c.post("/api/pull", json={
+        "camera_id": "abc",
+        "start": "2026-07-05T15:00:00+00:00",
+        "end": "2026-07-05T15:01:00+00:00"})
+    body = r.get_json()
+    assert r.status_code == 200
+    assert body["clip"].startswith("clips/")
+    assert body["presence"] == [[8.0, 14.0]]
+
+
+def test_pull_survives_presence_failure(client, monkeypatch):
+    from package_watcher.ui import hass, protect
+    from package_watcher.config import UnifiConfig
+
+    monkeypatch.setattr(hass, "discover_unifi_protect",
+                        lambda: UnifiConfig(host="10.0.0.5", api_key="k"))
+    monkeypatch.setattr(protect, "available", lambda: True)
+    monkeypatch.setattr(protect, "pull_clip",
+                        lambda cfg, cam, s, e, out: out)
+
+    def boom(cfg, cam, s, e):
+        raise RuntimeError("events API down")
+
+    monkeypatch.setattr(protect, "person_windows", boom)
+    c, _ = client
+    r = c.post("/api/pull", json={
+        "camera_id": "abc",
+        "start": "2026-07-05T15:00:00+00:00",
+        "end": "2026-07-05T15:01:00+00:00"})
+    body = r.get_json()
+    assert r.status_code == 200          # the clip is not lost
+    assert body["presence"] == []
+    assert "events API down" in body["presence_error"]
+
+
+def test_person_gated_case_end_to_end(client):
+    """Wizard round-trip: preview an unsaved gated case, save it, run it."""
+    c, fixtures = client
+    payload = {
+        "name": "gated-synthetic-delivery", "expect": "detect",
+        "scene": {"scene": "delivery", "warmup_s": 8, "approach_s": 3,
+                  "drop_s": 3, "tail_s": 12},
+        "fps": 2.0,
+        "detector": {"mode": "person_gated", "settle_samples": 3},
+        "presence": [[8.0, 14.0]],
+        "region": [0.40, 0.58, 0.22, 0.22],
+    }
+    # Verify step grades it before saving.
+    prev = c.post("/api/preview_case", json=payload).get_json()
+    assert prev["passed"] is True and prev["matched"] is True
+
+    # Save, then the saved case runs and passes too.
+    assert c.post("/api/save_case", json=payload).status_code == 200
+    text = (fixtures / "cases.yaml").read_text()
+    assert "mode: person_gated" in text and "presence:" in text
+    res = {r["name"]: r for r in c.post("/api/run").get_json()}
+    assert res["gated-synthetic-delivery"]["status"] == "pass"
+
+
 def test_cameras_use_discovered_protect(client, monkeypatch):
     from package_watcher.ui import hass, protect
     from package_watcher.config import UnifiConfig

@@ -10,7 +10,10 @@
 # Optional for a "detect" case: region (normalized x,y,w,h the detection must
 # overlap), after/before (clip-time window in seconds), max_reports.
 # Optional anywhere: fps, zone, detector (per-case config overrides),
-# attention (list of [start_s, end_s] windows simulating Protect triggers).
+# attention (list of [start_s, end_s] windows simulating Protect triggers),
+# presence (list of [start_s, end_s] person-in-frame windows — drives
+# detector: {mode: person_gated}, which compares the person-free scene
+# after a visit against the person-free scene before it).
 #
 # Run:  pytest tests/test_fixtures.py
 #   or: package-watcher test --fixtures fixtures
@@ -35,7 +38,29 @@ cases:
     expect: detect
     region: [0.40, 0.58, 0.22, 0.22]
 
+  - name: gated-delivery
+    description: >-
+      Person-gated mode; a person visits, the box lands mid-visit, and the
+      comparison after they leave finds exactly the box.
+    scene: {scene: delivery, warmup_s: 8, approach_s: 3, drop_s: 3, tail_s: 12}
+    fps: 2.0
+    detector: {mode: person_gated, settle_samples: 3}
+    presence: [[8.0, 14.0]]
+    expect: detect
+    region: [0.40, 0.58, 0.22, 0.22]
+    max_reports: 1
+
   # --- should NOT detect ----------------------------------------------
+  - name: gated-person-pauses
+    description: >-
+      Person-gated mode; a person stands around for a while and leaves
+      nothing — the classic background-model false positive.
+    scene: {scene: person_pauses, warmup_s: 8, walk_s: 3, pause_s: 10, tail_s: 10}
+    fps: 2.0
+    detector: {mode: person_gated}
+    presence: [[8.0, 24.0]]
+    expect: no_detect
+
   - name: empty-porch-noise-only
     description: Nothing happens; only sensor noise.
     scene: {scene: empty, seconds: 30}

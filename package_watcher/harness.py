@@ -18,7 +18,7 @@ from typing import Any, Iterator, Optional
 import numpy as np
 import yaml
 
-from .detector import DetectorConfig, NewObjectReport, StaticObjectDetector
+from .detector import DetectorConfig, NewObjectReport, build_detector
 from . import synthetic
 
 
@@ -32,6 +32,10 @@ class FixtureCase:
     zone: Optional[list[tuple[float, float]]] = None
     detector: dict[str, Any] = field(default_factory=dict)  # config overrides
     attention: list[tuple[float, float]] = field(default_factory=list)
+    # Person-in-frame windows [(start_s, end_s), ...], clip-relative. Drives
+    # detector mode "person_gated" (set via detector: {mode: person_gated});
+    # typically auto-imported from Protect smart-detect events with the clip.
+    presence: list[tuple[float, float]] = field(default_factory=list)
     # Optional tighter expectations for a "detect" case:
     region: Optional[tuple[float, float, float, float]] = None  # normalized
     after: Optional[float] = None     # detection must occur at/after this (s)
@@ -96,6 +100,8 @@ def load_cases(manifest_path: str) -> list[FixtureCase]:
             entry["region"] = tuple(entry["region"])
         if "attention" in entry and entry["attention"] is not None:
             entry["attention"] = [tuple(w) for w in entry["attention"]]
+        if "presence" in entry and entry["presence"] is not None:
+            entry["presence"] = [tuple(w) for w in entry["presence"]]
         unknown = set(entry) - set(FixtureCase.__dataclass_fields__)
         if unknown:
             raise ValueError(
@@ -150,7 +156,8 @@ def _in_windows(t: float, windows: list[tuple[float, float]]) -> bool:
 def run_case(case: FixtureCase, fixtures_dir: str = ".",
              capture_preview: bool = False) -> ClipResult:
     cfg = DetectorConfig(**case.detector)
-    detector = StaticObjectDetector(cfg, zone=case.zone)
+    detector = build_detector(cfg, zone=case.zone)
+    gated = cfg.mode == "person_gated"
     detections: list[Detection] = []
     det_frames: list[np.ndarray] = []
     det_masks: list[np.ndarray] = []
@@ -161,8 +168,13 @@ def run_case(case: FixtureCase, fixtures_dir: str = ".",
     for frame, t in iter_samples(case, fixtures_dir):
         if capture_preview and first_frame is None:
             first_frame = frame.copy()
-        att = _in_windows(t, case.attention)
-        for report in detector.process(frame, ts=t, attention=att):
+        if gated:
+            reports = detector.process(
+                frame, ts=t, person_present=_in_windows(t, case.presence))
+        else:
+            reports = detector.process(
+                frame, ts=t, attention=_in_windows(t, case.attention))
+        for report in reports:
             detections.append(Detection(
                 t=report.reported_at, bbox_norm=report.bbox_norm,
                 confidence=report.confidence, triggered=report.triggered,
