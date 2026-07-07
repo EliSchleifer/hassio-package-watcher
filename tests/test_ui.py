@@ -230,6 +230,21 @@ def test_preview_case_reports_detection_image(client):
     assert body["images"]["detection"].startswith("data:image/png;base64,")
 
 
+def test_preview_case_overlays_expected_region(client):
+    c, _ = client
+    r = c.post("/api/preview_case", json={
+        "name": "adhoc-region", "expect": "detect",
+        "scene": {"scene": "package", "hold_s": 14}, "fps": 2.0,
+        "detector": {"persist_samples": 6},
+        "region": [0.4, 0.5, 0.3, 0.35],
+    })
+    body = r.get_json()
+    assert r.status_code == 200
+    # region overlay path runs and still returns a detection image + timing
+    assert body["images"]["detection"].startswith("data:image/png;base64,")
+    assert "detection_time" in body
+
+
 def test_cameras_use_discovered_protect(client, monkeypatch):
     from package_watcher.ui import hass, protect
     from package_watcher.config import UnifiConfig

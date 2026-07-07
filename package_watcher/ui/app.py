@@ -280,15 +280,26 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
         det = frames.get("detection")
         if det is None:
             det = frames.get("first")
+        # Overlay the expected region (cyan) next to the detector's own box
+        # (green) so "right thing, right place?" is answerable at a glance.
+        if det is not None and case.region is not None:
+            det = det.copy()
+            dh, dw = det.shape[:2]
+            rx, ry, rw, rh = case.region
+            cv2.rectangle(det, (int(rx * dw), int(ry * dh)),
+                          (int((rx + rw) * dw), int((ry + rh) * dh)),
+                          (255, 200, 0), 2)
+        dets = outcome.result.detections
         return jsonify({
             "passed": outcome.passed,
             "reason": outcome.reason,
             "expect": case.expect,
+            "detection_time": round(dets[0].t, 1) if dets else None,
             "detections": [
                 {"t": round(d.t, 1),
                  "bbox": [round(v, 3) for v in d.bbox_norm],
                  "confidence": round(d.confidence, 3)}
-                for d in outcome.result.detections],
+                for d in dets],
             "images": {
                 "detection": _png_data_uri(det),
                 "mask": _png_data_uri(frames.get("mask")),
@@ -484,7 +495,7 @@ _PAGE = """<!doctype html>
 
   <!-- STEP 1: SOURCE -->
   <div class="wizstep" data-step="1">
-    <div class="row tight" style="gap:6px;margin-bottom:8px">
+    <div id="step1tabs" class="row tight" style="gap:6px;margin-bottom:8px">
       <button class="tab" data-src="scrub" onclick="srcTab('scrub')">Scrub Protect</button>
       <button class="tab" data-src="upload" onclick="srcTab('upload')">Upload file</button>
       <button class="tab" data-src="ref" onclick="srcTab('ref')">Reference / synthetic</button>
@@ -560,8 +571,25 @@ _PAGE = """<!doctype html>
       <div><label>fps</label><input id="fps" value="2.0"></div>
       <div><label>persist_samples</label><input id="persist" value="6"></div>
     </div>
-    <label>Expected region (detect only) — x y w h, normalized 0–1</label>
-    <input id="region" placeholder="0.35 0.55 0.30 0.35">
+
+    <div id="regionDrawer">
+      <label>Where should the package be? (detect only)</label>
+      <div class="muted">Scrub the clip to when the box is on the ground,
+        click <b>Draw box</b>, then drag a rectangle around it. The detector
+        must fire inside this region to pass.</div>
+      <div class="row tight" style="gap:6px;margin:6px 0">
+        <button type="button" id="drawToggle" class="tab" onclick="toggleDraw()">✏️ Draw box</button>
+        <button type="button" onclick="clearRegion()">Clear</button>
+        <span class="muted" id="regionReadout"></span>
+      </div>
+      <div id="regionWrap" style="position:relative;line-height:0">
+        <video id="rvid" preload="metadata" controls
+               style="width:100%;display:block;border:1px solid var(--line);border-radius:6px"></video>
+        <canvas id="rcanvas" style="position:absolute;left:0;top:0;pointer-events:none"></canvas>
+      </div>
+      <input id="region" type="hidden">
+    </div>
+
     <div class="row">
       <div><label>After (s)</label><input id="after"></div>
       <div><label>Before (s)</label><input id="before"></div>
@@ -648,6 +676,7 @@ function showStep(){
   document.getElementById('btnNext').style.display = step<3 ? '' : 'none';
   document.getElementById('btnSave').style.display = step===3 ? '' : 'none';
   wizMsg('');
+  if(step===2) enterStep2();
   if(step===3) verify();
 }
 function wizBack(){ if(step>1){ step--; showStep(); } }
@@ -661,8 +690,91 @@ function wizNext(){
 function srcTab(which){
   document.querySelectorAll('.srcpane').forEach(p =>
     p.style.display = (p.dataset.src===which) ? '' : 'none');
-  document.querySelectorAll('.tab').forEach(b =>
+  document.querySelectorAll('#step1tabs .tab').forEach(b =>
     b.classList.toggle('active', b.dataset.src===which));
+}
+
+// ---- region drawer (step 2): scrub the clip, drag a box on the frame ------
+let region = null, drawMode = false, drawStart = null;
+
+function enterStep2(){
+  const drawer = document.getElementById('regionDrawer');
+  const canDraw = !!wiz.clip && document.getElementById('expect').value === 'detect';
+  drawer.style.display = canDraw ? '' : 'none';
+  if(!canDraw) return;
+  const v = document.getElementById('rvid');
+  if(v.getAttribute('src') !== wiz.clip){ v.src = wiz.clip; }
+  parseRegionField();
+  syncCanvas();
+}
+function parseRegionField(){
+  const parts = (document.getElementById('region').value.trim().split(/\\s+/)).map(Number);
+  region = (parts.length === 4 && parts.every(n => !isNaN(n)))
+    ? {x:parts[0], y:parts[1], w:parts[2], h:parts[3]} : null;
+  updateRegionReadout();
+}
+function syncCanvas(){
+  const v = document.getElementById('rvid'), c = document.getElementById('rcanvas');
+  c.width = v.clientWidth || v.offsetWidth; c.height = v.clientHeight || v.offsetHeight;
+  drawRegion();
+}
+function toggleDraw(){
+  drawMode = !drawMode;
+  const c = document.getElementById('rcanvas'), v = document.getElementById('rvid');
+  c.style.pointerEvents = drawMode ? 'auto' : 'none';
+  c.style.cursor = 'crosshair';
+  document.getElementById('drawToggle').classList.toggle('active', drawMode);
+  if(drawMode) v.pause();
+  syncCanvas();
+}
+function _pt(e){
+  const c = document.getElementById('rcanvas'), r = c.getBoundingClientRect();
+  return {x:(e.clientX-r.left), y:(e.clientY-r.top)};
+}
+function _drawRect(a, b, dash){
+  const c = document.getElementById('rcanvas'), ctx = c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  ctx.strokeStyle = '#2a9d3f'; ctx.lineWidth = 2;
+  ctx.setLineDash(dash ? [6,4] : []);
+  ctx.strokeRect(Math.min(a.x,b.x), Math.min(a.y,b.y),
+                 Math.abs(a.x-b.x), Math.abs(a.y-b.y));
+  ctx.setLineDash([]);
+}
+function drawRegion(){
+  const c = document.getElementById('rcanvas'), ctx = c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  if(!region) return;
+  _drawRect({x:region.x*c.width, y:region.y*c.height},
+            {x:(region.x+region.w)*c.width, y:(region.y+region.h)*c.height}, true);
+}
+function commitRegion(a, b){
+  const c = document.getElementById('rcanvas');
+  const x = Math.min(a.x,b.x)/c.width, y = Math.min(a.y,b.y)/c.height;
+  const w = Math.abs(a.x-b.x)/c.width, h = Math.abs(a.y-b.y)/c.height;
+  if(w < 0.01 || h < 0.01){ return; }
+  region = {x,y,w,h};
+  document.getElementById('region').value =
+    `${x.toFixed(3)} ${y.toFixed(3)} ${w.toFixed(3)} ${h.toFixed(3)}`;
+  updateRegionReadout(); drawRegion();
+}
+function clearRegion(){
+  region = null; document.getElementById('region').value = '';
+  updateRegionReadout();
+  const c = document.getElementById('rcanvas');
+  if(c.getContext) c.getContext('2d').clearRect(0,0,c.width,c.height);
+}
+function updateRegionReadout(){
+  document.getElementById('regionReadout').textContent = region
+    ? `region ${region.x.toFixed(2)}, ${region.y.toFixed(2)}, ${region.w.toFixed(2)}, ${region.h.toFixed(2)}`
+    : 'no region set';
+}
+function initDrawer(){
+  const c = document.getElementById('rcanvas');
+  c.addEventListener('pointerdown', e => { if(drawMode){ drawStart = _pt(e); } });
+  c.addEventListener('pointermove', e => { if(drawMode && drawStart){ _drawRect(drawStart, _pt(e), false); } });
+  c.addEventListener('pointerup',  e => { if(drawMode && drawStart){ commitRegion(drawStart, _pt(e)); drawStart = null; } });
+  document.getElementById('rvid').addEventListener('loadeddata', syncCanvas);
+  window.addEventListener('resize', () => { if(step===2) syncCanvas(); });
 }
 
 // ---- source: cameras ------------------------------------------------------
@@ -798,14 +910,25 @@ async function verify(){
   if(res.error){ box.innerHTML = `<div class="fail">error: ${res.error}</div>`; return; }
   const cls = res.passed ? 'pass' : 'fail';
   const mark = res.passed ? '✓ grades as you expect' : '✗ does NOT grade as expected';
-  const dets = (res.detections||[]).map(d =>
-    `t=${d.t}s · region=(${d.bbox.join(', ')}) · conf=${d.confidence}`).join('<br>') || 'none';
+  const all = res.detections || [];
+  const n = all.length;
+  const cap = res.detection_time != null
+    ? `frame at first detection (t=${res.detection_time}s)`
+    : 'no detection — showing first frame';
+  // Show the first few detections, then summarize the rest.
+  const shown = all.slice(0, 5).map(d =>
+    `t=${d.t}s · (${d.bbox.join(', ')}) · conf=${d.confidence}`).join('<br>');
+  const more = n > 5 ? `<br>…and ${n-5} more` : '';
+  const legend = res.images.detection
+    ? '<div class="muted"><span style="color:var(--ok)">■ detected</span> · <span style="color:#00c8ff">■ your expected region</span></div>'
+    : '';
   box.innerHTML = `<div class="${cls}"><b>${mark}</b> — ${res.reason}</div>
+    ${legend}
     <div class="row" style="align-items:flex-start;margin-top:8px">
-      <div><div class="muted">detection</div>${res.images.detection?`<img class="preview" src="${res.images.detection}">`:'<div class="muted">—</div>'}</div>
+      <div><div class="muted">${cap}</div>${res.images.detection?`<img class="preview" src="${res.images.detection}">`:'<div class="muted">—</div>'}</div>
       <div><div class="muted">diff mask</div>${res.images.mask?`<img class="preview" src="${res.images.mask}">`:'<div class="muted">—</div>'}</div>
     </div>
-    <div class="muted" style="margin-top:6px">detections: ${dets}</div>`;
+    <div class="muted" style="margin-top:6px">${n} detection(s)${n?':<br>'+shown+more:''}</div>`;
 }
 
 async function saveCase(){
@@ -819,6 +942,7 @@ async function saveCase(){
 }
 
 srcTab('scrub');
+initDrawer();
 loadCases();
 </script>
 __LIVERELOAD__
