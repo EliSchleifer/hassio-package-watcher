@@ -122,6 +122,67 @@ def _person_then_package(rng, size, fps, region, spec) -> list[np.ndarray]:
     return frames
 
 
+def _person_figure(f: np.ndarray, x_norm: float) -> None:
+    h, w = f.shape[:2]
+    x = int(x_norm * w)
+    pw = int(0.08 * w)
+    f[int(0.4 * h):int(0.85 * h), x:x + pw] = _PERSON
+
+
+def _delivery(rng, size, fps, region, spec) -> list[np.ndarray]:
+    """The realistic delivery bracket for person-gated mode: a person walks
+    up, the package appears mid-visit (while they are still in frame), and
+    the person leaves with the box already on the ground.
+
+    Person is in frame for [warmup_s, warmup_s + approach_s + drop_s] —
+    use that as the case's `presence` window."""
+    warmup = _n(spec.get("warmup_s", 10), fps)
+    approach = _n(spec.get("approach_s", 3), fps)
+    drop = _n(spec.get("drop_s", 3), fps)     # person + package both visible
+    tail = _n(spec.get("tail_s", 12), fps)    # package alone
+    frames = [_done(_base(rng, size)) for _ in range(warmup)]
+    for i in range(approach):
+        f = _base(rng, size)
+        _person_figure(f, 0.05 + 0.40 * (i / max(1, approach - 1)))
+        frames.append(_done(f))
+    for _ in range(drop):
+        f = _base(rng, size)
+        _fill(f, region, _CARDBOARD)
+        _person_figure(f, 0.45)
+        frames.append(_done(f))
+    for _ in range(tail):
+        f = _base(rng, size)
+        _fill(f, region, _CARDBOARD)
+        frames.append(_done(f))
+    return frames
+
+
+def _person_pauses(rng, size, fps, region, spec) -> list[np.ndarray]:
+    """A person walks in, stands still for a while, and leaves with nothing —
+    the classic false positive for continuous background models.
+
+    Person is in frame for [warmup_s, warmup_s + 2*walk_s + pause_s]."""
+    warmup = _n(spec.get("warmup_s", 10), fps)
+    walk = _n(spec.get("walk_s", 3), fps)
+    pause = _n(spec.get("pause_s", 10), fps)
+    tail = _n(spec.get("tail_s", 12), fps)
+    frames = [_done(_base(rng, size)) for _ in range(warmup)]
+    for i in range(walk):
+        f = _base(rng, size)
+        _person_figure(f, 0.05 + 0.40 * (i / max(1, walk - 1)))
+        frames.append(_done(f))
+    for _ in range(pause):
+        f = _base(rng, size)
+        _person_figure(f, 0.45)
+        frames.append(_done(f))
+    for i in range(walk):
+        f = _base(rng, size)
+        _person_figure(f, 0.45 + 0.45 * (i / max(1, walk - 1)))
+        frames.append(_done(f))
+    frames += [_done(_base(rng, size)) for _ in range(tail)]
+    return frames
+
+
 def _lighting_drift(rng, size, fps, region, spec) -> list[np.ndarray]:
     n = _n(spec.get("seconds", 40), fps)
     rate = float(spec.get("rate", 1.0))  # brightness units per sample
@@ -166,6 +227,8 @@ _SCENES = {
     "package": _package,
     "person_only": _person_only,
     "person_then_package": _person_then_package,
+    "delivery": _delivery,
+    "person_pauses": _person_pauses,
     "lighting_drift": _lighting_drift,
     "light_switch": _light_switch,
     "shadow_sweep": _shadow_sweep,

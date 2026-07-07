@@ -48,6 +48,10 @@ class UnifiConfig:
     verify_ssl: bool = False
     trigger_types: list[str] = field(default_factory=lambda: ["person"])
     attention_seconds: float = 120.0
+    # In person_gated mode: how long a person event keeps the camera in
+    # "person present" after its last websocket update. Ongoing events keep
+    # refreshing it; the hold papers over sparse updates near the end.
+    presence_hold_seconds: float = 10.0
     # Maps watcher camera name -> Protect camera display name.
     camera_map: dict[str, str] = field(default_factory=dict)
 

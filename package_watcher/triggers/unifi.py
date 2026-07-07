@@ -21,8 +21,9 @@ from ..config import UnifiConfig
 
 log = logging.getLogger(__name__)
 
-# Callback signature: (watcher_camera_name, trigger_kind, epoch_ts)
-TriggerCallback = Callable[[str, str, float], None]
+# Callback signature: (watcher_camera_name, trigger_kind, start_epoch_ts,
+# end_epoch_ts). end is None while the event is still ongoing.
+TriggerCallback = Callable[[str, str, float, "float | None"], None]
 
 
 class UnifiTriggerListener:
@@ -104,9 +105,11 @@ class UnifiTriggerListener:
                 if watcher_name is None:
                     return  # not a camera we watch
                 start = getattr(obj, "start", None)
+                end = getattr(obj, "end", None)
                 ts = start.timestamp() if start is not None else None
                 import time as _time
-                self.on_trigger(watcher_name, hit, ts or _time.time())
+                self.on_trigger(watcher_name, hit, ts or _time.time(),
+                                end.timestamp() if end is not None else None)
             except Exception as exc:  # noqa: BLE001
                 log.debug("ignoring malformed protect message: %s", exc)
 

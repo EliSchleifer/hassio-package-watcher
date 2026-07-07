@@ -60,6 +60,31 @@ because a new stationary object right after a person at the door is very
 likely a delivery. Triggers are an accelerant, not a requirement — the
 rolling window catches drop-offs even when no trigger fires.
 
+### Person-gated mode (`detector.mode: person_gated`)
+
+The continuous model above has a known weakness: a person who *pauses* gets
+absorbed by the fast background and can read as a new static object, and the
+slow background drifts with sun and shadows. If your NVR already knows when a
+person is in frame (Protect smart detections — it does), a simpler, stronger
+contract is available:
+
+1. While the scene is **person-free and quiet**, keep a *reference* frame of
+   the empty scene (it tracks slow lighting drift, and motion never smears
+   into it).
+2. The moment a **person appears**, freeze the reference and detect nothing.
+3. When they **leave** and the scene settles, compare the settled frame
+   against the frozen reference: anything new, static, and package-shaped is
+   reported — then the reference re-seeds so the *next* visit is measured
+   against the porch as it is now.
+
+The two frames compared are both person-free and at most minutes apart, so
+lighting has barely moved and people can't false-positive by definition. The
+tradeoff: an object that appears with **no person event is never reported**
+(most deliveries involve a person). Set `detector.mode: person_gated`; live
+person presence comes from the `unifi` trigger websocket, and fixtures carry
+labeled `presence: [[start_s, end_s], ...]` windows — auto-imported from
+Protect's event history when the UI pulls a clip.
+
 ### Showing its work
 
 Every event is a self-describing JSON payload plus an evidence directory:
