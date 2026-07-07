@@ -133,6 +133,32 @@ def test_empty_day_has_no_hits():
     assert _run({0: {}}).hits == []
 
 
+def test_same_sample_hits_grouped_into_one_card():
+    """Three blobs from one comparison = ONE sample card with 3 numbered
+    boxes, not three same-timestamp events."""
+    pytest.importorskip("flask")
+    from package_watcher.backtest import Hit
+    from package_watcher.ui.app import _group_hits
+
+    f = make_frame(np.random.default_rng(1))
+    t = datetime(2026, 7, 6, 11, 30, tzinfo=UTC)
+    t2 = t + timedelta(seconds=600)
+
+    def hit(at, bbox):
+        return Hit(at=at, bbox=bbox, bbox_norm=(0.1, 0.1, 0.1, 0.1),
+                   confidence=0.8, frame=f, crop=f)
+
+    groups = _group_hits([hit(t, (10, 10, 30, 30)),
+                          hit(t, (100, 50, 40, 30)),
+                          hit(t, (200, 150, 46, 32)),
+                          hit(t2, (10, 10, 30, 30))])
+    assert len(groups) == 2
+    by_at = {g["at"]: g for g in groups}
+    assert len(by_at[t.isoformat()]["boxes"]) == 3
+    assert len(by_at[t2.isoformat()]["boxes"]) == 1
+    assert by_at[t.isoformat()]["jpg"].startswith("data:image/jpeg")
+
+
 def test_verifier_attached_to_hits(monkeypatch):
     ver = FlorenceVerifier(VerifierConfig(backend="florence"))
     monkeypatch.setattr(ver, "_caption", lambda crop: "a cardboard box")
