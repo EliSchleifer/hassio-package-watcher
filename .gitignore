@@ -9,3 +9,5 @@ dist/
 events/
 /config.yaml
 .DS_Store
+# Real camera footage stays local — clips are private and huge.
+fixtures/clips/
