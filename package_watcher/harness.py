@@ -69,11 +69,15 @@ class ClipResult:
     samples: int
     scene_resets: int
     frames_for_preview: dict[str, np.ndarray] = field(default_factory=dict)
-    # Annotated frame + mask per detection (aligned with `detections`), only
-    # populated when capture_preview=True. Lets the UI show the frame of the
-    # detection that actually matched the expectation, not just the first.
+    # Annotated frame + mask + raw frame/bbox per detection (aligned with
+    # `detections`), only populated when capture_preview=True. Lets the UI
+    # show the frame of the detection that actually matched the expectation,
+    # and hand the *clean* frame to the verifier (captioning an annotated
+    # frame would let the drawn box leak into the caption).
     det_frames: list[np.ndarray] = field(default_factory=list)
     det_masks: list[np.ndarray] = field(default_factory=list)
+    det_raw: list[np.ndarray] = field(default_factory=list)
+    det_bboxes: list[tuple[int, int, int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -155,6 +159,8 @@ def run_case(case: FixtureCase, fixtures_dir: str = ".",
     detections: list[Detection] = []
     det_frames: list[np.ndarray] = []
     det_masks: list[np.ndarray] = []
+    det_raw: list[np.ndarray] = []
+    det_bboxes: list[tuple[int, int, int, int]] = []
     samples = 0
     preview: dict[str, np.ndarray] = {}
     first_frame: Optional[np.ndarray] = None
@@ -177,6 +183,8 @@ def run_case(case: FixtureCase, fixtures_dir: str = ".",
                 annotated = _annotate(report)
                 det_frames.append(annotated)
                 det_masks.append(report.mask)
+                det_raw.append(report.frame)
+                det_bboxes.append(report.bbox)
                 if "detection" not in preview:
                     preview["detection"] = annotated
                     preview["baseline"] = report.baseline
@@ -189,7 +197,8 @@ def run_case(case: FixtureCase, fixtures_dir: str = ".",
     return ClipResult(case=case, detections=detections, samples=samples,
                       scene_resets=detector.scene_resets,
                       frames_for_preview=preview,
-                      det_frames=det_frames, det_masks=det_masks)
+                      det_frames=det_frames, det_masks=det_masks,
+                      det_raw=det_raw, det_bboxes=det_bboxes)
 
 
 def _annotate(report: NewObjectReport) -> np.ndarray:

@@ -41,7 +41,8 @@ LLM_PROMPT_TEMPLATE = (
 
 def build_event(camera: str, report: NewObjectReport,
                 trigger: Optional[TriggerInfo] = None,
-                evidence_paths: Optional[dict[str, str]] = None) -> dict[str, Any]:
+                evidence_paths: Optional[dict[str, str]] = None,
+                verification: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     x, y, w, h = report.bbox
     fw, fh = report.frame_size
     stamp = datetime.fromtimestamp(report.reported_at, tz=timezone.utc)
@@ -70,6 +71,9 @@ def build_event(camera: str, report: NewObjectReport,
             {"kind": trigger.kind, "source": trigger.source, "at": _iso(trigger.at)}
             if trigger else None
         ),
+        # Verdict from the local vision model (verify.py), when enabled:
+        # {accepted, label, caption, backend, model}.
+        "verification": verification,
         "evidence": evidence_paths or {},
         "llm_verification": {
             "suggested_prompt": LLM_PROMPT_TEMPLATE.format(

@@ -64,7 +64,20 @@ class CameraWorker:
         else:
             reports = self.detector.process(frame, ts, attention=attention)
         for report in reports:
-            event = build_event(self.cam.name, report, trigger=trigger)
+            verdict = None
+            if self.app.verifier is not None:
+                try:
+                    verdict = self.app.verifier.verify(frame, report.bbox)
+                except Exception as exc:  # noqa: BLE001 - verification is
+                    # best-effort; a model failure must never eat an event.
+                    log.error("[%s] verifier failed: %s", self.cam.name, exc)
+                if (verdict is not None and not verdict["accepted"]
+                        and self.app.config.verifier.suppress_rejected):
+                    log.info("[%s] candidate rejected by verifier: %s",
+                             self.cam.name, verdict["caption"])
+                    continue
+            event = build_event(self.cam.name, report, trigger=trigger,
+                                verification=verdict)
             try:
                 write_evidence(event, report, self.app.config.events_dir)
             except Exception as exc:  # noqa: BLE001 - keep watching even if disk fails
@@ -88,6 +101,8 @@ class WatcherService:
     def __init__(self, config: AppConfig):
         self.config = config
         self.sinks = EventSinks(config.sinks)
+        from .verify import build_verifier
+        self.verifier = build_verifier(config.verifier)
         self.workers = {cam.name: CameraWorker(cam, self)
                         for cam in config.cameras}
         self._threads: list[threading.Thread] = []
