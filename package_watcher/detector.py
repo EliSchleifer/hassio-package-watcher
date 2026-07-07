@@ -37,6 +37,11 @@ class DetectorConfig:
     slow_alpha: float = 0.004        # slow background learning rate per sample
     min_area_frac: float = 0.0008    # ignore blobs smaller than this
     max_area_frac: float = 0.25      # ignore blobs bigger than this (lighting)
+    max_aspect_ratio: float = 2.5    # reject blobs taller than this (h/w):
+                                     # upright people/legs, not packages
+    min_extent: float = 0.25         # reject blobs that fill < this of their
+                                     # bbox (wispy/edge shapes, e.g. a person's
+                                     # outline) vs. a solid package rectangle
     persist_samples: int = 8         # samples a blob must survive to report
     persist_samples_triggered: int = 4  # lower bar inside an attention window
     miss_limit: int = 6              # drop a candidate after this many misses
@@ -204,6 +209,14 @@ class StaticObjectDetector:
             x, y, w, h, area = stats[i]
             frac = area / total
             if frac < self.cfg.min_area_frac or frac > self.cfg.max_area_frac:
+                continue
+            # Shape priors: a package is a compact, roughly square-to-wide
+            # rectangle sitting on a surface. Reject tall upright blobs (a
+            # standing/pausing person, a leg) and wispy outlines that don't
+            # fill their bounding box — the two ways people slip through.
+            if h > w * self.cfg.max_aspect_ratio:
+                continue
+            if area < self.cfg.min_extent * w * h:
                 continue
             blob = (labels == i)
             contrast = float(diff_slow[blob].mean()) / 255.0
