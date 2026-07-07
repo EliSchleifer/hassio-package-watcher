@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import threading
 from datetime import datetime
 from typing import Any, Optional
 
@@ -30,7 +31,7 @@ from ..harness import FixtureCase, load_cases, run_and_evaluate
 
 
 def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
-               reload: bool = False):
+               reload: bool = False, verifier_cfg=None):
     try:
         from flask import (Flask, Response, jsonify, request,
                            send_from_directory)
@@ -49,9 +50,22 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024  # 512 MB uploads
 
+    # Second-stage semantic verification (Florence), when configured. Built
+    # once; the model itself loads lazily on first use.
+    from ..verify import build_verifier
+    verifier = build_verifier(verifier_cfg) if verifier_cfg else None
+
     # Live-reload (dev): the page polls /__alive; when the process restarts
     # (Flask's reloader on file save), the boot id changes and the browser
     # reloads itself — edit -> save -> refreshed page, no manual F5.
+    # The 1 Hz poll would flood the access log, so drop those lines.
+    import logging as _logging
+
+    class _AliveFilter(_logging.Filter):
+        def filter(self, record):  # noqa: A003
+            return "__alive" not in record.getMessage()
+
+    _logging.getLogger("werkzeug").addFilter(_AliveFilter())
     boot_id = str(os.getpid())
     livereload = (
         "<script>let _b=null;setInterval(async()=>{try{"
@@ -336,12 +350,21 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
             cv2.rectangle(det, (int(rx * dw), int(ry * dh)),
                           (int((rx + rw) * dw), int((ry + rh) * dh)),
                           (255, 200, 0), 2)
+        # Second stage: caption the matched candidate's clean crop, so the
+        # wizard shows what the vision model thinks it is.
+        verdict = None
+        if verifier is not None and mi is not None and mi < len(res.det_raw):
+            try:
+                verdict = verifier.verify(res.det_raw[mi], res.det_bboxes[mi])
+            except Exception as exc:  # noqa: BLE001
+                verdict = {"error": str(exc)}
         return jsonify({
             "passed": outcome.passed,
             "reason": outcome.reason,
             "expect": case.expect,
             "detection_time": round(det_t, 1) if det_t is not None else None,
             "matched": mi is not None,
+            "verification": verdict,
             "detections": [
                 {"t": round(d.t, 1),
                  "bbox": [round(v, 3) for v in d.bbox_norm],
@@ -352,6 +375,96 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
                 "mask": _png_data_uri(mask),
             },
         })
+
+    # --- backtest: scan a camera's recorded day every X minutes ------------
+    bt = {"running": False, "progress": [0, 0], "error": None, "result": None,
+          "partial": []}
+
+    def _hit_jpg(hit) -> Optional[str]:
+        img = hit.frame.copy()
+        x, y, w, h = hit.bbox
+        th = max(2, img.shape[1] // 640)
+        cv2.rectangle(img, (x, y), (x + w, y + h), (60, 220, 60), th)
+        scale = 480 / img.shape[1]
+        if scale < 1:
+            img = cv2.resize(img, (480, int(img.shape[0] * scale)),
+                             interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return ("data:image/jpeg;base64," +
+                base64.b64encode(buf.tobytes()).decode()) if ok else None
+
+    def _bt_json(res) -> dict[str, Any]:
+        return {
+            "camera_id": res.camera_id,
+            "start": res.start.isoformat(), "end": res.end.isoformat(),
+            "interval_s": res.interval_s,
+            "samples_total": res.samples_total,
+            "samples_skipped_person": res.samples_skipped_person,
+            "samples_missing": res.samples_missing,
+            "scene_flips": res.scene_flips,
+            "hits": [{
+                "at": h.at.isoformat(),
+                "bbox_norm": [round(v, 4) for v in h.bbox_norm],
+                "confidence": round(h.confidence, 3),
+                "verification": h.verification,
+                "jpg": _hit_jpg(h),
+            } for h in res.hits],
+        }
+
+    @app.post("/api/backtest")
+    def api_backtest() -> Any:
+        from . import protect
+        u, _ = _resolve_unifi()
+        if u is None or not protect.available():
+            return jsonify({"error": "Protect not configured"}), 400
+        if bt["running"]:
+            return jsonify({"error": "a backtest is already running"}), 409
+        data = request.get_json(force=True)
+        try:
+            start = datetime.fromisoformat(data["start"])
+            end = datetime.fromisoformat(data["end"])
+            interval_s = float(data.get("interval_s", 600))
+            camera_id = data["camera_id"]
+        except (KeyError, ValueError) as exc:
+            return jsonify({"error": f"bad params: {exc}"}), 400
+        want_verify = bool(data.get("verify")) and verifier is not None
+
+        def job():
+            try:
+                from .. import backtest as btmod
+                try:
+                    windows = protect.person_windows(u, camera_id, start, end)
+                except Exception:  # noqa: BLE001 - windows are an optimization
+                    windows = []
+                res = btmod.run_backtest(
+                    btmod.protect_snapshot_fn(u, camera_id), camera_id,
+                    start, end, interval_s=interval_s,
+                    person_windows=windows,
+                    verifier=verifier if want_verify else None,
+                    progress=lambda i, n: bt.update(progress=[i, n]),
+                    on_hit=lambda h: bt["partial"].append({
+                        "at": h.at.isoformat(),
+                        "bbox_norm": [round(v, 4) for v in h.bbox_norm],
+                        "confidence": round(h.confidence, 3),
+                        "verification": h.verification,
+                        "jpg": _hit_jpg(h)}))
+                bt["result"] = _bt_json(res)
+            except Exception as exc:  # noqa: BLE001
+                bt["error"] = str(exc)
+            finally:
+                bt["running"] = False
+
+        bt.update(running=True, error=None, result=None, progress=[0, 0],
+                  partial=[])
+        threading.Thread(target=job, daemon=True, name="backtest").start()
+        return jsonify({"started": True,
+                        "verify": want_verify,
+                        "verifier_available": verifier is not None})
+
+    @app.get("/api/backtest/status")
+    def api_backtest_status() -> Any:
+        return jsonify({k: bt[k] for k in
+                        ("running", "progress", "error", "result", "partial")})
 
     return app
 
@@ -451,8 +564,10 @@ def _upsert_case(manifest_path: str, case: dict[str, Any]) -> None:
 
 
 def serve(fixtures_dir: str, unifi: Optional[UnifiConfig],
-          host: str, port: int, reload: bool = False) -> None:
-    app = create_app(fixtures_dir, unifi, reload=reload)
+          host: str, port: int, reload: bool = False,
+          verifier_cfg=None) -> None:
+    app = create_app(fixtures_dir, unifi, reload=reload,
+                     verifier_cfg=verifier_cfg)
     print(f"package-watcher UI on http://{host}:{port}  "
           f"(fixtures: {os.path.abspath(fixtures_dir)})"
           + ("  [reload — edits auto-refresh the browser]" if reload else ""))
@@ -527,6 +642,35 @@ _PAGE = """<!doctype html>
     <h2>Fixture cases</h2>
     <table id="cases"><tbody></tbody></table>
     <div id="preview"></div>
+  </section>
+
+  <section style="margin-top:28px">
+    <h2>Backtest a day</h2>
+    <div class="muted">Scan a camera's recorded history: one snapshot every
+      X minutes (people skipped via Protect events), each compared with the
+      previous one — candidate packages are shown with where they appeared.
+      Optionally the vision model captions each candidate.</div>
+    <div class="row" style="margin-top:8px">
+      <div><label>Camera</label>
+        <select id="btCam"><option value="">— none —</option></select></div>
+      <div><label>Day</label><input type="date" id="btDate"></div>
+      <div><label>Every</label>
+        <select id="btInt">
+          <option value="300">5 min</option>
+          <option value="600" selected>10 min</option>
+          <option value="900">15 min</option>
+          <option value="1800">30 min</option>
+        </select></div>
+      <div><label>2nd stage</label>
+        <select id="btVerify">
+          <option value="1" selected>Florence verify</option>
+          <option value="">CV only</option>
+        </select></div>
+      <div style="flex:0 0 auto"><label>&nbsp;</label>
+        <button class="primary" onclick="runBacktest()">Run</button></div>
+    </div>
+    <div id="btStatus" class="muted" style="margin-top:6px"></div>
+    <div id="btResults"></div>
   </section>
 </main>
 
@@ -904,9 +1048,12 @@ async function loadCameras(){
     sel.innerHTML = `<option value="">unavailable: ${res.reason}</option>`;
     note.textContent = ''; return;
   }
+  const bt = document.getElementById('btCam');
+  bt.innerHTML = '';
   for(const cam of res.cameras){
     const o = document.createElement('option');
     o.value = cam.id; o.textContent = cam.name; sel.appendChild(o);
+    bt.appendChild(o.cloneNode(true));
   }
   note.textContent = (res.source === 'homeassistant')
     ? `${res.cameras.length} camera(s) from Home Assistant. Recorded-clip scrub needs a Protect NVR — for these, upload or reference a clip.`
@@ -1075,7 +1222,15 @@ async function verify(){
   const legend = res.images.detection
     ? '<div class="muted"><span style="color:var(--ok)">■ detected</span> · <span style="color:#00c8ff">■ your expected region</span></div>'
     : '';
+  let vline = '';
+  if(res.verification){
+    const v = res.verification;
+    vline = v.error
+      ? `<div class="muted">🔎 verifier error: ${v.error}</div>`
+      : `<div class="${v.accepted ? 'pass' : 'fail'}">🔎 model sees: “${v.caption}” → ${v.accepted ? 'accepted' : 'rejected'} (${v.label})</div>`;
+  }
   box.innerHTML = `<div class="${cls}"><b>${mark}</b> — ${res.reason}</div>
+    ${vline}
     ${legend}
     <div class="row" style="align-items:flex-start;margin-top:8px">
       <div><div class="muted">${cap}</div>${res.images.detection?`<img class="preview" src="${res.images.detection}">`:'<div class="muted">—</div>'}</div>
@@ -1092,6 +1247,79 @@ async function saveCase(){
   wizMsg('saved '+res.saved);
   await loadCases();
   closeWiz();
+}
+
+// ---- backtest ---------------------------------------------------------
+let btTimer = null;
+
+async function runBacktest(){
+  const cam = document.getElementById('btCam').value;
+  const day = document.getElementById('btDate').value;
+  if(!cam || !day){ msg('btStatus','pick a camera and a day'); return; }
+  const start = new Date(day + 'T00:00:00');
+  const end = new Date(start.getTime() + 24*3600*1000);
+  const res = await j('api/backtest', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({camera_id: cam,
+      start: start.toISOString(), end: end.toISOString(),
+      interval_s: parseFloat(document.getElementById('btInt').value),
+      verify: !!document.getElementById('btVerify').value})});
+  if(res.error){ msg('btStatus', res.error); return; }
+  if(res.verify === false && document.getElementById('btVerify').value){
+    msg('btStatus','note: verifier not configured on the server — CV only');
+  }
+  document.getElementById('btResults').innerHTML = '';
+  if(btTimer) clearInterval(btTimer);
+  btTimer = setInterval(pollBt, 2000);
+  pollBt();
+}
+
+async function pollBt(){
+  const s = await j('api/backtest/status');
+  if(s.running){
+    msg('btStatus', `scanning… sample ${s.progress[0]}/${s.progress[1]}`
+      + (s.partial.length ? ` · ${s.partial.length} candidate(s) so far` : ''));
+    if(s.partial.length) renderHits(s.partial);   // play forward as it scans
+    return;
+  }
+  clearInterval(btTimer); btTimer = null;
+  if(s.error){ msg('btStatus','backtest failed: '+s.error); return; }
+  if(s.result) renderBt(s.result);
+}
+
+function renderBt(r){
+  msg('btStatus',
+    `${r.samples_total} samples · ${r.samples_skipped_person} skipped (person)`
+    + ` · ${r.samples_missing} missing · ${r.scene_flips} lighting flips`
+    + ` · ${r.hits.length} candidate(s)`);
+  if(!r.hits.length){
+    document.getElementById('btResults').innerHTML =
+      '<div class="muted" style="margin-top:8px">no candidate packages found</div>';
+    return;
+  }
+  renderHits(r.hits);
+}
+
+function renderHits(hits){
+  const el = document.getElementById('btResults');
+  el.innerHTML = '';
+  const grid = document.createElement('div');
+  grid.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;margin-top:10px';
+  for(const h of hits){
+    const v = h.verification;
+    const vhtml = !v ? '<div class="muted">no 2nd stage</div>'
+      : v.error ? `<div class="muted">verifier error: ${v.error}</div>`
+      : `<div class="${v.accepted?'pass':'fail'}">${v.accepted?'✓':'✗'} “${v.caption}”</div>`;
+    const card = document.createElement('div');
+    card.style.cssText = 'border:1px solid var(--line);border-radius:8px;padding:8px';
+    card.innerHTML = `${h.jpg?`<img src="${h.jpg}" style="width:100%;border-radius:5px">`:''}
+      <div><b>${new Date(h.at).toLocaleTimeString()}</b>
+        <span class="muted">conf ${h.confidence}</span></div>
+      <div class="muted">at (${h.bbox_norm.join(', ')})</div>
+      ${vhtml}`;
+    grid.appendChild(card);
+  }
+  el.appendChild(grid);
 }
 
 srcTab('scrub');

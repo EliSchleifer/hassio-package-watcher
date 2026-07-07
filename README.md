@@ -85,6 +85,44 @@ person presence comes from the `unifi` trigger websocket, and fixtures carry
 labeled `presence: [[start_s, end_s], ...]` windows — auto-imported from
 Protect's event history when the UI pulls a clip.
 
+### Second stage: local vision verification (`verifier:`)
+
+The CV stages can only say "something new and static is here" — in fixtures
+a human judges *what* it is (the region you draw); live, nothing does. The
+verifier fills that role with **Florence-2 running locally on CPU**: each
+candidate crop is captioned, and caption keywords decide package vs noise.
+
+```yaml
+verifier:
+  backend: florence            # off (default) | florence
+  # model: florence-community/Florence-2-base
+  # accept: [package, box, parcel, carton, envelope, crate]
+  # suppress_rejected: true    # drop events the model rejects
+```
+
+Needs the `[verify]` extra (torch CPU + transformers). The model (~0.5 GB)
+downloads on first use and stays loaded; a few seconds per crop, and crops
+only happen at delivery frequency. Verdicts ride on every event as
+`verification: {accepted, label, caption}`, appear in the wizard's verify
+step, and on every backtest hit.
+
+### Backtesting a camera's recorded history
+
+The production question is "every X minutes, is there maybe a package?" —
+so test exactly that against footage the NVR already has:
+
+```bash
+package-watcher backtest -c config.yaml --camera "Front Door" \
+    --date 2026-07-05 --interval 10 --verify --out ./hits
+```
+
+One snapshot per interval (cheap JPEGs, no video download), samples with a
+person in frame are skipped (Protect events), each is compared with the
+previous person-free one, and package-shaped changes become hits — each with
+where-in-frame, a confidence, and (with `--verify`) the model's caption. The
+same scan lives in the UI under **Backtest a day**: pick camera, date,
+interval → hits stream in as the day plays forward.
+
 ### Showing its work
 
 Every event is a self-describing JSON payload plus an evidence directory:
@@ -261,7 +299,6 @@ footage** — the fixture suite above, authored from your own cameras.
 
 ## Roadmap
 
-- Built-in LLM verification stage (send evidence to a vision model, attach verdict)
 - MQTT sink for native HA discovery
 - Auto-discovery of cameras/RTSP URLs via the Protect API
 - Removal events ("the package that appeared at X is gone")

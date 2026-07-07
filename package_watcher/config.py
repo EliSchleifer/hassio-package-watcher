@@ -57,6 +57,26 @@ class UnifiConfig:
 
 
 @dataclass
+class VerifierConfig:
+    """Semantic verification of candidate crops with a local vision model.
+
+    The CV stages find "something new and static"; the verifier answers
+    *what is it* — the role a human labeler plays in fixtures, played live
+    by a model. Off by default: it needs the `[verify]` extra installed."""
+
+    backend: str = "off"             # "off" | "florence"
+    # The florence-community repos are the official conversions for native
+    # transformers support (microsoft/* still targets trust_remote_code).
+    model: str = "florence-community/Florence-2-base"
+    cache_dir: Optional[str] = None  # model download cache (default: HF cache)
+    # Caption keywords that count as a delivered item.
+    accept: list[str] = field(default_factory=lambda: [
+        "package", "box", "parcel", "carton", "envelope", "crate"])
+    crop_margin: float = 0.35        # context margin around the bbox crop
+    suppress_rejected: bool = False  # drop events whose crop isn't accepted
+
+
+@dataclass
 class SinkConfig:
     jsonl_path: Optional[str] = None
     webhook_url: Optional[str] = None
@@ -68,6 +88,7 @@ class AppConfig:
     cameras: list[CameraConfig]
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     unifi: Optional[UnifiConfig] = None
+    verifier: VerifierConfig = field(default_factory=VerifierConfig)
     sinks: SinkConfig = field(default_factory=SinkConfig)
     events_dir: str = "./events"
 
@@ -101,12 +122,14 @@ def load_config(path: str, require_cameras: bool = True) -> AppConfig:
     detector = _dataclass_from(DetectorConfig, raw.get("detector") or {})
     unifi = (_dataclass_from(UnifiConfig, raw["unifi"])
              if raw.get("unifi") else None)
+    verifier = _dataclass_from(VerifierConfig, raw.get("verifier") or {})
     sinks = _dataclass_from(SinkConfig, raw.get("sinks") or {})
 
     return AppConfig(
         cameras=cameras,
         detector=detector,
         unifi=unifi,
+        verifier=verifier,
         sinks=sinks,
         events_dir=raw.get("events_dir", "./events"),
     )

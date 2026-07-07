@@ -18,6 +18,11 @@ dependencies = [
 [project.optional-dependencies]
 unifi = ["uiprotect>=6.0"]
 ui = ["flask>=3.0"]
+# Second-stage semantic verification (Florence-2 on CPU). Install torch from
+# the CPU index to avoid CUDA wheels: pip install torch --index-url
+# https://download.pytorch.org/whl/cpu && pip install ".[verify]"
+verify = ["torch>=2.1", "transformers>=4.54", "timm>=0.9", "einops>=0.7",
+          "pillow>=10"]
 dev = ["pytest>=8.0", "flask>=3.0"]
 
 [project.scripts]
