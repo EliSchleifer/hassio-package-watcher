@@ -76,13 +76,15 @@ def _dataclass_from(cls, data: dict[str, Any]):
     return cls(**data)
 
 
-def load_config(path: str) -> AppConfig:
+def load_config(path: str, require_cameras: bool = True) -> AppConfig:
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
     raw = _interpolate(raw)
 
     cameras_raw = raw.get("cameras") or []
-    if not cameras_raw:
+    # The authoring UI only needs the `unifi` block, so it loads with
+    # require_cameras=False — a config with just credentials is valid there.
+    if not cameras_raw and require_cameras:
         raise ValueError("config must define at least one camera")
     cameras = []
     for cam in cameras_raw:

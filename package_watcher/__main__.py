@@ -47,7 +47,42 @@ def _build_parser() -> argparse.ArgumentParser:
     ui.add_argument("--reload", action="store_true",
                     help="auto-restart on code edits (dev; needs an editable "
                          "install) so you can iterate without rebuilding")
+    ui.add_argument("--setup", action="store_true",
+                    help="prompt for UniFi Protect credentials and write them "
+                         "to --config (default config.yaml), then serve")
     return parser
+
+
+def _setup_unifi(path: str) -> None:
+    """Interactively write a UniFi Protect `unifi:` config for the UI.
+
+    Credentials are typed into the local terminal and written straight to the
+    file — nothing is echoed back. Leave the host blank to skip (you can still
+    upload clips / use synthetic scenes).
+    """
+    import getpass
+
+    import yaml
+
+    print(f"Set up UniFi Protect credentials (written to {path}).\n"
+          f"Leave the host blank to skip.", file=sys.stderr)
+    host = input("  NVR host / IP: ").strip()
+    if not host:
+        print("  skipped.", file=sys.stderr)
+        return
+    username = input("  username (blank if using an API key): ").strip()
+    password = getpass.getpass("  password (blank if using an API key): ").strip()
+    api_key = getpass.getpass("  API key (blank if using user/pass): ").strip()
+    block: dict = {"host": host, "verify_ssl": False}
+    if username:
+        block["username"] = username
+    if password:
+        block["password"] = password
+    if api_key:
+        block["api_key"] = api_key
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump({"unifi": block}, f, sort_keys=False)
+    print(f"  wrote {path}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -60,8 +95,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "test":
         return _run_tests(args)
     if args.command == "ui":
+        import os
         from .ui.app import serve
-        unifi = load_config(args.config).unifi if args.config else None
+        cfg_path = args.config or "config.yaml"
+        if args.setup:
+            _setup_unifi(cfg_path)
+        unifi = (load_config(cfg_path, require_cameras=False).unifi
+                 if os.path.isfile(cfg_path) else None)
         serve(fixtures_dir=args.fixtures, unifi=unifi,
               host=args.host, port=args.port, reload=args.reload)
         return 0
