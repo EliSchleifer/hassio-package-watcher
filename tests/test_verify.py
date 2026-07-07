@@ -110,6 +110,9 @@ def test_package_arrival_is_hit_once_at_right_spot():
     x, y, w, h = PKG
     hx, hy, hw, hh = hit.bbox
     assert abs(hx - x) < 12 and abs(hy - y) < 12
+    # The comparison pair rides along: baseline = previous clean sample.
+    assert hit.baseline_at == DAY + timedelta(seconds=600 * 5)
+    assert hit.baseline is not None and hit.baseline.shape == hit.frame.shape
 
 
 def test_person_windows_are_skipped():
@@ -144,9 +147,13 @@ def test_same_sample_hits_grouped_into_one_card():
     t = datetime(2026, 7, 6, 11, 30, tzinfo=UTC)
     t2 = t + timedelta(seconds=600)
 
+    before = make_frame(np.random.default_rng(2))
+    t0 = t - timedelta(seconds=600)
+
     def hit(at, bbox):
         return Hit(at=at, bbox=bbox, bbox_norm=(0.1, 0.1, 0.1, 0.1),
-                   confidence=0.8, frame=f, crop=f)
+                   confidence=0.8, frame=f, crop=f,
+                   baseline=before, baseline_at=t0)
 
     groups = _group_hits([hit(t, (10, 10, 30, 30)),
                           hit(t, (100, 50, 40, 30)),
@@ -157,6 +164,9 @@ def test_same_sample_hits_grouped_into_one_card():
     assert len(by_at[t.isoformat()]["boxes"]) == 3
     assert len(by_at[t2.isoformat()]["boxes"]) == 1
     assert by_at[t.isoformat()]["jpg"].startswith("data:image/jpeg")
+    # The before/after comparison pair is exposed on the group.
+    assert by_at[t.isoformat()]["before_jpg"].startswith("data:image/jpeg")
+    assert by_at[t.isoformat()]["before_at"] == t0.isoformat()
 
 
 def test_verifier_attached_to_hits(monkeypatch):

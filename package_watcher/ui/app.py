@@ -31,7 +31,8 @@ from ..harness import FixtureCase, load_cases, run_and_evaluate
 
 
 def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
-               reload: bool = False, verifier_cfg=None):
+               reload: bool = False, verifier_cfg=None,
+               zones_path: Optional[str] = None):
     try:
         from flask import (Flask, Response, jsonify, request,
                            send_from_directory)
@@ -45,7 +46,29 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
     fixtures_dir = os.path.abspath(fixtures_dir)
     clips_dir = os.path.join(fixtures_dir, "clips")
     manifest_path = os.path.join(fixtures_dir, "cases.yaml")
+    # Watch zones live in the CONFIG space (zones.yaml next to config.yaml)
+    # so the live watcher picks them up too; fixtures dir is the fallback
+    # when the UI runs without a config file.
+    zones_path = zones_path or os.path.join(fixtures_dir, "zones.yaml")
     os.makedirs(clips_dir, exist_ok=True)
+
+    # Per-camera watch zones (normalized polygons keyed by camera id AND
+    # display name — the live service resolves by name via camera_map):
+    # everything outside the zone is ignored.
+    def _load_zones() -> dict[str, list]:
+        if not os.path.isfile(zones_path):
+            return {}
+        with open(zones_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+
+    def _store_zone(camera_id: str, poly) -> None:
+        zones = _load_zones()
+        if poly:
+            zones[camera_id] = poly
+        else:
+            zones.pop(camera_id, None)
+        with open(zones_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(zones, f, sort_keys=True)
 
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024  # 512 MB uploads
@@ -228,10 +251,12 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
             return Response("Protect not configured", status=400)
         camera_id = request.args.get("camera_id")
         at = request.args.get("at")
-        if not camera_id or not at:
-            return Response("camera_id and at required", status=400)
+        if not camera_id:
+            return Response("camera_id required", status=400)
         try:
-            dt = datetime.fromisoformat(at)
+            # No `at` = the live view (recorded footage at "now" does not
+            # exist yet) — used by the zone drawer.
+            dt = datetime.fromisoformat(at) if at else None
             width = int(request.args.get("width", 640))
         except ValueError as exc:
             return Response(f"bad params: {exc}", status=400)
@@ -392,6 +417,57 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
             "hits": _group_hits(res.hits),
         }
 
+    @app.get("/api/zone")
+    def api_zone_get() -> Any:
+        camera_id = request.args.get("camera_id", "")
+        return jsonify({"camera_id": camera_id,
+                        "zone": _load_zones().get(camera_id)})
+
+    @app.get("/api/zone/protect")
+    def api_zone_protect() -> Any:
+        """Zones already configured on the camera in Protect, importable."""
+        from . import protect
+        u, _ = _resolve_unifi()
+        if u is None or not protect.available():
+            return jsonify({"error": "Protect not configured"}), 400
+        camera_id = request.args.get("camera_id", "")
+        try:
+            return jsonify({"zones": protect.camera_zones(u, camera_id)})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 502
+
+    @app.post("/api/zone")
+    def api_zone_set() -> Any:
+        data = request.get_json(force=True)
+        camera_id = data.get("camera_id")
+        if not camera_id:
+            return jsonify({"error": "camera_id required"}), 400
+        rect = data.get("rect")  # [x, y, w, h] normalized, or null to clear
+        poly = data.get("poly")  # or a full polygon [[x,y], ...]
+        if poly:
+            try:
+                poly = [[float(a), float(b)] for a, b in poly]
+            except (TypeError, ValueError):
+                return jsonify({"error": "poly must be [[x, y], ...]"}), 400
+            if len(poly) < 3:
+                return jsonify({"error": "poly needs at least 3 points"}), 400
+        elif rect:
+            try:
+                x, y, w, h = (float(v) for v in rect)
+            except (TypeError, ValueError):
+                return jsonify({"error": "rect must be [x, y, w, h]"}), 400
+            if w <= 0 or h <= 0:
+                return jsonify({"error": "rect must have positive size"}), 400
+            poly = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+        else:
+            poly = None
+        _store_zone(camera_id, poly)
+        # Also key by display name so the live watcher can resolve the zone
+        # through unifi.camera_map (which maps to Protect display names).
+        if data.get("camera_name"):
+            _store_zone(data["camera_name"], poly)
+        return jsonify({"camera_id": camera_id, "zone": poly})
+
     @app.post("/api/backtest")
     def api_backtest() -> Any:
         from . import protect
@@ -423,10 +499,12 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
                     raw_hits.append(h)
                     bt["partial"] = _group_hits(raw_hits)
 
+                zone = _load_zones().get(camera_id)
                 res = btmod.run_backtest(
                     btmod.protect_snapshot_fn(u, camera_id), camera_id,
                     start, end, interval_s=interval_s,
                     person_windows=windows,
+                    zone=[tuple(p) for p in zone] if zone else None,
                     verifier=verifier if want_verify else None,
                     progress=lambda i, n: bt.update(progress=[i, n]),
                     on_hit=stream)
@@ -474,14 +552,22 @@ def _group_jpg(frame, bboxes) -> Optional[str]:
 
 def _group_hits(hits) -> list[dict[str, Any]]:
     """One comparison can yield several blobs; present them as ONE sample
-    with numbered boxes, not as separate same-timestamp events."""
+    with numbered boxes, not as separate same-timestamp events. Each group
+    carries the comparison pair — the person-free 'before' snapshot and the
+    annotated 'after' — so garbage candidates explain themselves (lighting
+    moved, camera shifted, …)."""
     groups: dict[str, dict[str, Any]] = {}
     frames: dict[str, Any] = {}
+    baselines: dict[str, Any] = {}
     bboxes: dict[str, list] = {}
     for h in hits:
         key = h.at.isoformat()
         g = groups.setdefault(key, {"at": key, "boxes": []})
         frames[key] = h.frame  # same frame for every blob of the sample
+        if getattr(h, "baseline", None) is not None:
+            baselines[key] = h.baseline
+            g["before_at"] = (h.baseline_at.isoformat()
+                              if h.baseline_at else None)
         bboxes.setdefault(key, []).append(h.bbox)
         g["boxes"].append({
             "bbox_norm": [round(v, 4) for v in h.bbox_norm],
@@ -491,6 +577,8 @@ def _group_hits(hits) -> list[dict[str, Any]]:
     out = []
     for key, g in groups.items():
         g["jpg"] = _group_jpg(frames[key], bboxes[key])
+        g["before_jpg"] = (_group_jpg(baselines[key], [])
+                           if key in baselines else None)
         out.append(g)
     return out
 
@@ -589,9 +677,9 @@ def _upsert_case(manifest_path: str, case: dict[str, Any]) -> None:
 
 def serve(fixtures_dir: str, unifi: Optional[UnifiConfig],
           host: str, port: int, reload: bool = False,
-          verifier_cfg=None) -> None:
+          verifier_cfg=None, zones_path: Optional[str] = None) -> None:
     app = create_app(fixtures_dir, unifi, reload=reload,
-                     verifier_cfg=verifier_cfg)
+                     verifier_cfg=verifier_cfg, zones_path=zones_path)
     print(f"package-watcher UI on http://{host}:{port}  "
           f"(fixtures: {os.path.abspath(fixtures_dir)})"
           + ("  [reload — edits auto-refresh the browser]" if reload else ""))
@@ -693,6 +781,25 @@ _PAGE = """<!doctype html>
         </select></div>
       <div style="flex:0 0 auto"><label>&nbsp;</label>
         <button class="primary" onclick="runBacktest()">Run</button></div>
+    </div>
+    <div class="row tight" style="gap:8px;margin-top:6px">
+      <button onclick="openZone()">🎯 Watch zone…</button>
+      <span id="zoneInfo" class="muted"></span>
+    </div>
+    <div id="zoneUI" style="display:none;max-width:640px;margin-top:8px">
+      <div class="muted">Drag a rectangle over the area to care about
+        (the porch landing) — everything outside it is ignored by backtests
+        on this camera.</div>
+      <div style="position:relative;line-height:0;margin-top:6px">
+        <img id="zimg" style="width:100%;border:1px solid var(--line);border-radius:6px">
+        <canvas id="zcanvas" style="position:absolute;left:0;top:0;cursor:crosshair"></canvas>
+      </div>
+      <div class="row tight" style="gap:6px;margin-top:6px">
+        <button class="primary" onclick="saveZone()">Save zone</button>
+        <button onclick="clearZone()">Clear zone</button>
+        <select id="pzones" style="width:auto"><option value="">import from Protect…</option></select>
+        <button onclick="document.getElementById('zoneUI').style.display='none'">Close</button>
+      </div>
     </div>
     <div id="btStatus" class="muted" style="margin-top:6px"></div>
     <div id="btResults"></div>
@@ -1276,6 +1383,117 @@ async function saveCase(){
   closeWiz();
 }
 
+// ---- per-camera watch zone ---------------------------------------------
+// Canonical state is a normalized POLYGON: drawn rectangles become 4-corner
+// polys, and zones imported from Protect keep their full shape.
+let zonePoly = null, zoneDrag = null, protectZones = [];
+
+function camName(){ const s = document.getElementById('btCam');
+  return s.options[s.selectedIndex] ? s.options[s.selectedIndex].text : ''; }
+
+async function openZone(){
+  const cam = document.getElementById('btCam').value;
+  if(!cam){ msg('btStatus','pick a camera first'); return; }
+  msg('btStatus','');
+  document.getElementById('zoneUI').style.display = '';
+  const img = document.getElementById('zimg');
+  img.onload = () => { syncZoneCanvas(); drawZone(); };
+  img.onerror = () => msg('btStatus',
+    'could not fetch a live snapshot from this camera — is Protect reachable?');
+  // No `at` = live view; recorded footage at "now" doesn't exist yet.
+  img.src = `api/snapshot?camera_id=${encodeURIComponent(cam)}&width=640&t=${Date.now()}`;
+  const res = await j(`api/zone?camera_id=${encodeURIComponent(cam)}`);
+  zonePoly = res.zone || null;
+  updateZoneInfo(); syncZoneCanvas(); drawZone();
+  loadProtectZones(cam);
+}
+
+async function loadProtectZones(cam){
+  const sel = document.getElementById('pzones');
+  sel.innerHTML = '<option value="">import from Protect…</option>';
+  sel.onchange = () => {
+    const i = parseInt(sel.value);
+    if(!isNaN(i) && protectZones[i]){
+      zonePoly = protectZones[i].points;
+      drawZone(); updateZoneInfo();
+      msg('btStatus', `imported Protect zone “${protectZones[i].name}” — Save zone to keep it`);
+    }
+  };
+  const res = await j(`api/zone/protect?camera_id=${encodeURIComponent(cam)}`);
+  if(res.error || !res.zones || !res.zones.length){
+    sel.options[0].text = 'no Protect zones on this camera'; return;
+  }
+  protectZones = res.zones;
+  res.zones.forEach((z, i) => {
+    const o = document.createElement('option');
+    o.value = i; o.textContent = `${z.name} (${z.kind}, ${z.points.length} pts)`;
+    sel.appendChild(o);
+  });
+}
+
+function syncZoneCanvas(){
+  const img = document.getElementById('zimg'), c = document.getElementById('zcanvas');
+  c.width = img.clientWidth; c.height = img.clientHeight;
+}
+function drawZone(){
+  const c = document.getElementById('zcanvas'), ctx = c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  if(!zonePoly || zonePoly.length < 3) return;
+  // Dim everything outside the polygon (even-odd fill), outline the zone.
+  ctx.beginPath();
+  ctx.rect(0,0,c.width,c.height);
+  ctx.moveTo(zonePoly[0][0]*c.width, zonePoly[0][1]*c.height);
+  for(const [x,y] of zonePoly.slice(1)) ctx.lineTo(x*c.width, y*c.height);
+  ctx.closePath();
+  ctx.fillStyle = '#0008';
+  ctx.fill('evenodd');
+  ctx.beginPath();
+  ctx.moveTo(zonePoly[0][0]*c.width, zonePoly[0][1]*c.height);
+  for(const [x,y] of zonePoly.slice(1)) ctx.lineTo(x*c.width, y*c.height);
+  ctx.closePath();
+  ctx.strokeStyle = '#00c8ff'; ctx.lineWidth = 2;
+  ctx.stroke();
+}
+function initZoneDrawer(){
+  const c = document.getElementById('zcanvas');
+  const pt = e => { const r = c.getBoundingClientRect();
+    return {x:(e.clientX-r.left)/c.width, y:(e.clientY-r.top)/c.height}; };
+  c.addEventListener('pointerdown', e => { zoneDrag = pt(e); });
+  c.addEventListener('pointermove', e => {
+    if(!zoneDrag) return;
+    const p = pt(e);
+    const x0 = Math.min(zoneDrag.x,p.x), y0 = Math.min(zoneDrag.y,p.y);
+    const x1 = Math.max(zoneDrag.x,p.x), y1 = Math.max(zoneDrag.y,p.y);
+    zonePoly = [[x0,y0],[x1,y0],[x1,y1],[x0,y1]];
+    drawZone();
+  });
+  c.addEventListener('pointerup', () => { zoneDrag = null; updateZoneInfo(); });
+}
+function updateZoneInfo(){
+  document.getElementById('zoneInfo').textContent = (zonePoly && zonePoly.length >= 3)
+    ? `zone: ${zonePoly.length} points`
+    : 'no zone — whole frame watched';
+}
+async function saveZone(){
+  const cam = document.getElementById('btCam').value;
+  if(!zonePoly || zonePoly.length < 3){
+    msg('btStatus','drag a rectangle (or import a Protect zone) first'); return; }
+  const res = await j('api/zone', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({camera_id: cam, camera_name: camName(),
+                          poly: zonePoly})});
+  if(res.error){ msg('btStatus', res.error); return; }
+  msg('btStatus','watch zone saved — everything outside it is now ignored');
+  updateZoneInfo();
+}
+async function clearZone(){
+  const cam = document.getElementById('btCam').value;
+  await j('api/zone', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({camera_id: cam, camera_name: camName(), rect: null})});
+  zonePoly = null; drawZone(); updateZoneInfo();
+  msg('btStatus','watch zone cleared — whole frame watched');
+}
+
 // ---- backtest ---------------------------------------------------------
 let btTimer = null;
 
@@ -1337,7 +1555,7 @@ function renderBt(r){
 function renderHits(groups){
   const el = document.getElementById('btResults');
   const grid = document.createElement('div');
-  grid.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-top:10px';
+  grid.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:12px;margin-top:10px';
   for(const g of groups){
     // One card per SAMPLE; a comparison can yield several candidate boxes,
     // numbered to match the labels drawn on the frame.
@@ -1353,7 +1571,18 @@ function renderHits(groups){
     const card = document.createElement('div');
     card.style.cssText = 'border:1px solid var(--line);border-radius:8px;padding:8px'
       + (g.boxes.some(b=>b.verification) && !anyAccepted ? ';opacity:.55' : '');
-    card.innerHTML = `${g.jpg?`<img src="${g.jpg}" style="width:100%;border-radius:5px">`:''}
+    // Show the comparison pair: the person-free baseline this sample was
+    // diffed against, then the sample with the candidate boxes drawn.
+    const beforeT = g.before_at ? new Date(g.before_at).toLocaleTimeString() : '';
+    const pair = g.before_jpg
+      ? `<div style="display:flex;gap:4px">
+           <div style="flex:1"><div class="muted">before ${beforeT}</div>
+             <img src="${g.before_jpg}" style="width:100%;border-radius:5px"></div>
+           <div style="flex:1"><div class="muted">after ${new Date(g.at).toLocaleTimeString()}</div>
+             <img src="${g.jpg}" style="width:100%;border-radius:5px"></div>
+         </div>`
+      : (g.jpg ? `<img src="${g.jpg}" style="width:100%;border-radius:5px">` : '');
+    card.innerHTML = `${pair}
       <div><b>${new Date(g.at).toLocaleTimeString()}</b>
         <span class="muted">${g.boxes.length} candidate box(es)</span></div>
       ${rows}`;
@@ -1367,6 +1596,7 @@ function renderHits(groups){
 
 srcTab('scrub');
 initDrawer();
+initZoneDrawer();
 loadCases();
 </script>
 __LIVERELOAD__
