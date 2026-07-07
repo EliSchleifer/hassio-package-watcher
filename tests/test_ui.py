@@ -129,6 +129,28 @@ def test_discover_unifi_protect_absent(tmp_path, monkeypatch):
     assert hass.discover_unifi_protect() is None
 
 
+def test_load_config_unifi_only():
+    import tempfile, os
+    from package_watcher.config import load_config
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "c.yaml")
+    with open(p, "w") as f:
+        f.write("unifi:\n  host: 10.0.0.5\n  api_key: k\n")
+    cfg = load_config(p, require_cameras=False)
+    assert cfg.unifi.host == "10.0.0.5" and cfg.cameras == []
+
+
+def test_livereload_only_in_reload_mode(tmp_path):
+    from package_watcher.ui.app import create_app
+    (tmp_path / "cases.yaml").write_text("cases: []\n")
+    off = create_app(str(tmp_path)).test_client().get("/").get_data(as_text=True)
+    assert "fetch('__alive')" not in off
+    app = create_app(str(tmp_path), reload=True)
+    on = app.test_client().get("/").get_data(as_text=True)
+    assert "fetch('__alive')" in on
+    assert app.test_client().get("/__alive").status_code == 200
+
+
 def test_snapshot_returns_jpeg(client, monkeypatch):
     from package_watcher.ui import hass, protect
     from package_watcher.config import UnifiConfig

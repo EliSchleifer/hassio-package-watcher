@@ -27,7 +27,8 @@ from ..config import UnifiConfig
 from ..harness import FixtureCase, load_cases, run_and_evaluate, run_case
 
 
-def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None):
+def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
+               reload: bool = False):
     try:
         from flask import (Flask, Response, jsonify, request,
                            send_from_directory)
@@ -46,6 +47,20 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None):
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024  # 512 MB uploads
 
+    # Live-reload (dev): the page polls /__alive; when the process restarts
+    # (Flask's reloader on file save), the boot id changes and the browser
+    # reloads itself — edit -> save -> refreshed page, no manual F5.
+    boot_id = str(os.getpid())
+    livereload = (
+        "<script>let _b=null;setInterval(async()=>{try{"
+        "const r=await fetch('__alive');const t=await r.text();"
+        "if(_b&&_b!==t)location.reload();_b=t;}catch(e){}},1000);</script>"
+    ) if reload else ""
+
+    @app.get("/__alive")
+    def _alive() -> Any:
+        return Response(boot_id, mimetype="text/plain")
+
     def _resolve_unifi():
         """(UnifiConfig|None, discovered): explicit `unifi` block wins;
         otherwise try to reuse the HA UniFi Protect integration's creds."""
@@ -63,7 +78,8 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None):
         # relative fetch/img URL below resolve correctly both there and when
         # run standalone (prefix empty -> base "/").
         prefix = request.headers.get("X-Ingress-Path", "").rstrip("/")
-        return _PAGE.replace("__INGRESS_BASE__", prefix)
+        return (_PAGE.replace("__INGRESS_BASE__", prefix)
+                     .replace("__LIVERELOAD__", livereload))
 
     # --- case data --------------------------------------------------------
     @app.get("/api/cases")
@@ -376,12 +392,12 @@ def _upsert_case(manifest_path: str, case: dict[str, Any]) -> None:
 
 def serve(fixtures_dir: str, unifi: Optional[UnifiConfig],
           host: str, port: int, reload: bool = False) -> None:
-    app = create_app(fixtures_dir, unifi)
+    app = create_app(fixtures_dir, unifi, reload=reload)
     print(f"package-watcher UI on http://{host}:{port}  "
           f"(fixtures: {os.path.abspath(fixtures_dir)})"
-          + ("  [reload]" if reload else ""))
-    # reload=True enables Flask's auto-restart-on-edit for fast local
-    # iteration (edit -> refresh browser); off by default for the add-on.
+          + ("  [reload — edits auto-refresh the browser]" if reload else ""))
+    # reload=True enables Flask's auto-restart-on-edit plus browser
+    # live-reload for fast local iteration; off by default for the add-on.
     app.run(host=host, port=port, debug=reload, use_reloader=reload)
 
 
@@ -805,5 +821,6 @@ async function saveCase(){
 srcTab('scrub');
 loadCases();
 </script>
+__LIVERELOAD__
 </body></html>
 """
