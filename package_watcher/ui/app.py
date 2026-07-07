@@ -417,6 +417,19 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
             "hits": _group_hits(res.hits),
         }
 
+    @app.get("/api/verifier")
+    def api_verifier() -> Any:
+        """Is the second stage real? configured = a backend is set up;
+        loaded = the model weights are in memory (first verify loads them)."""
+        if verifier is None:
+            return jsonify({"configured": False,
+                            "reason": "no verifier block in the config "
+                                      "(verifier: {backend: florence})"})
+        return jsonify({"configured": True,
+                        "backend": verifier.cfg.backend,
+                        "model": verifier.cfg.model,
+                        "loaded": verifier._model is not None})
+
     @app.get("/api/zone")
     def api_zone_get() -> Any:
         camera_id = request.args.get("camera_id", "")
@@ -778,7 +791,8 @@ _PAGE = """<!doctype html>
         <select id="btVerify">
           <option value="1" selected>Florence verify</option>
           <option value="">CV only</option>
-        </select></div>
+        </select>
+        <div class="muted" id="vstat">checking verifier…</div></div>
       <div style="flex:0 0 auto"><label>&nbsp;</label>
         <button class="primary" onclick="runBacktest()">Run</button></div>
     </div>
@@ -1594,10 +1608,20 @@ function renderHits(groups){
   el.appendChild(grid);
 }
 
+async function verifierStatus(){
+  try{
+    const v = await j('api/verifier');
+    msg('vstat', v.configured
+      ? `${v.backend} ready (${v.model.split('/').pop()}${v.loaded ? ', loaded' : ', loads on first use'})`
+      : `NOT configured — ${v.reason}`);
+  }catch(e){ msg('vstat',''); }
+}
+
 srcTab('scrub');
 initDrawer();
 initZoneDrawer();
 loadCases();
+verifierStatus();
 </script>
 __LIVERELOAD__
 </body></html>
