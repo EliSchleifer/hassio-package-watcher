@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from ..config import UnifiConfig
@@ -178,6 +178,14 @@ def camera_zones(cfg: UnifiConfig, camera_id: str) -> list[dict[str, Any]]:
                     out.append({"name": z.name, "kind": kind, "points": pts})
         return out
     return asyncio.run(_with_client(cfg, _fn))
+
+
+def person_events(cfg: UnifiConfig, camera_id: str, start: datetime,
+                  end: datetime) -> list[tuple[datetime, datetime]]:
+    """Person smart-detect events over [start, end] as absolute datetimes —
+    the raw material for replaying every visit as a labelable card."""
+    return [(start + timedelta(seconds=a), start + timedelta(seconds=b))
+            for a, b in person_windows(cfg, camera_id, start, end)]
 
 
 def person_windows(cfg: UnifiConfig, camera_id: str, start: datetime,
