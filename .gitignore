@@ -11,3 +11,5 @@ events/
 .DS_Store
 # Real camera footage stays local — clips are private and huge.
 fixtures/clips/
+# Training images are real footage — local only (labels.jsonl may be committed).
+fixtures/training/images/

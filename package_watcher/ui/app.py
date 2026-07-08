@@ -544,6 +544,119 @@ def create_app(fixtures_dir: str, unifi: Optional[UnifiConfig] = None,
         return jsonify({k: bt[k] for k in
                         ("running", "progress", "error", "result", "partial")})
 
+    # --- training data: replay person events, label them --------------------
+    training_dir = os.path.join(fixtures_dir, "training")
+    training_images = os.path.join(training_dir, "images")
+    labels_path = os.path.join(training_dir, "labels.jsonl")
+    rv = {"running": False, "progress": [0, 0], "error": None, "partial": []}
+
+    def _save_jpg(img, name: str) -> Optional[str]:
+        os.makedirs(training_images, exist_ok=True)
+        cv2.imwrite(os.path.join(training_images, name), img,
+                    [cv2.IMWRITE_JPEG_QUALITY, 92])
+        return f"training/images/{name}"
+
+    def _event_card(ev) -> dict[str, Any]:
+        stamp = ev.start.strftime("%Y%m%dT%H%M%S")
+        card: dict[str, Any] = {
+            "index": ev.index,
+            "start": ev.start.isoformat(), "end": ev.end.isoformat(),
+            "before_at": ev.before_at.isoformat() if ev.before_at else None,
+            "after_at": ev.after_at.isoformat() if ev.after_at else None,
+            "error": ev.error, "scene_flip": ev.scene_flip,
+            "candidates": [{
+                "bbox_norm": [round(v, 4) for v in c.bbox_norm],
+                "confidence": round(c.confidence, 3),
+                "verification": c.verification,
+            } for c in ev.candidates],
+        }
+        if ev.before is not None and ev.after is not None:
+            # Full-res copies land on disk for the training set; the card
+            # itself carries display-size data URIs.
+            card["before_path"] = _save_jpg(ev.before, f"{stamp}-before.jpg")
+            card["after_path"] = _save_jpg(ev.after, f"{stamp}-after.jpg")
+            card["before_jpg"] = _group_jpg(ev.before, [])
+            card["after_jpg"] = _group_jpg(
+                ev.after, [c.bbox for c in ev.candidates])
+        return card
+
+    @app.post("/api/review")
+    def api_review() -> Any:
+        """Replay a range's person events as labelable before/after cards."""
+        from . import protect
+        u, _ = _resolve_unifi()
+        if u is None or not protect.available():
+            return jsonify({"error": "Protect not configured"}), 400
+        if rv["running"] or bt["running"]:
+            return jsonify({"error": "another scan is already running"}), 409
+        data = request.get_json(force=True)
+        try:
+            start = datetime.fromisoformat(data["start"])
+            end = datetime.fromisoformat(data["end"])
+            camera_id = data["camera_id"]
+            settle_s = float(data.get("settle_s", 45))
+        except (KeyError, ValueError) as exc:
+            return jsonify({"error": f"bad params: {exc}"}), 400
+        want_verify = bool(data.get("verify", True)) and verifier is not None
+
+        def job():
+            try:
+                from .. import backtest as btmod
+                from .. import review as rvmod
+                events = protect.person_events(u, camera_id, start, end)
+                if not events:
+                    rv["error"] = "no person events recorded in that range"
+                    return
+                zone = _load_zones().get(camera_id)
+                rvmod.review_person_events(
+                    btmod.protect_snapshot_fn(u, camera_id), events,
+                    settle_s=settle_s,
+                    zone=[tuple(p) for p in zone] if zone else None,
+                    verifier=verifier if want_verify else None,
+                    progress=lambda i, n: rv.update(progress=[i, n]),
+                    on_event=lambda ev: rv["partial"].append(_event_card(ev)))
+            except Exception as exc:  # noqa: BLE001
+                rv["error"] = str(exc)
+            finally:
+                rv["running"] = False
+
+        rv.update(running=True, error=None, progress=[0, 0], partial=[])
+        threading.Thread(target=job, daemon=True, name="review").start()
+        return jsonify({"started": True, "verify": want_verify})
+
+    @app.get("/api/review/status")
+    def api_review_status() -> Any:
+        return jsonify({k: rv[k]
+                        for k in ("running", "progress", "error", "partial")})
+
+    @app.post("/api/label")
+    def api_label() -> Any:
+        """Append one human label to the training set (JSONL + images kept
+        locally next to the fixtures, like clips)."""
+        import json
+
+        data = request.get_json(force=True)
+        label = data.get("label")
+        if label not in ("package", "none"):
+            return jsonify({"error": "label must be 'package' or 'none'"}), 400
+        record = {
+            "camera_id": data.get("camera_id"),
+            "event_start": data.get("event_start"),
+            "event_end": data.get("event_end"),
+            "before": data.get("before_path"),
+            "after": data.get("after_path"),
+            "label": label,
+            "bbox_norm": data.get("bbox_norm"),   # the chosen box, if any
+            "caption": data.get("caption"),
+            "labeled_at": datetime.now().astimezone().isoformat(
+                timespec="seconds"),
+        }
+        os.makedirs(training_dir, exist_ok=True)
+        with open(labels_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+        count = sum(1 for _ in open(labels_path, encoding="utf-8"))
+        return jsonify({"saved": True, "total_labels": count})
+
     return app
 
 
@@ -824,6 +937,30 @@ _PAGE = """<!doctype html>
     </div>
     <div id="btStatus" class="muted" style="margin-top:6px"></div>
     <div id="btResults"></div>
+  </section>
+
+  <section style="margin-top:28px">
+    <h2>Build training data — label person events</h2>
+    <div class="muted">The camera already remembers every person visit.
+      Replay a day of them: each becomes a before/after card with proposed
+      boxes and the model's caption — mark 📦 or Ø and it lands in
+      <code>fixtures/training/labels.jsonl</code> (images kept locally).</div>
+    <div class="row" style="margin-top:8px">
+      <div><label>Camera</label>
+        <select id="rvCam"><option value="">— none —</option></select></div>
+      <div><label>Day</label><input type="date" id="rvDate" autocomplete="off"
+        data-form-type="other" data-lpignore="true" data-1p-ignore></div>
+      <div><label>Settle after visit</label>
+        <select id="rvSettle">
+          <option value="30">30 s</option>
+          <option value="45" selected>45 s</option>
+          <option value="90">90 s</option>
+        </select></div>
+      <div style="flex:0 0 auto"><label>&nbsp;</label>
+        <button class="primary" onclick="runReview()">Replay events</button></div>
+    </div>
+    <div id="rvStatus" class="muted" style="margin-top:6px"></div>
+    <div id="rvResults"></div>
   </section>
 </main>
 
@@ -1218,11 +1355,13 @@ async function loadCameras(){
     note.textContent = ''; return;
   }
   const bt = document.getElementById('btCam');
-  bt.innerHTML = '';
+  const rvSel = document.getElementById('rvCam');
+  bt.innerHTML = ''; rvSel.innerHTML = '';
   for(const cam of res.cameras){
     const o = document.createElement('option');
     o.value = cam.id; o.textContent = cam.name; sel.appendChild(o);
     bt.appendChild(o.cloneNode(true));
+    rvSel.appendChild(o.cloneNode(true));
   }
   note.textContent = (res.source === 'homeassistant')
     ? `${res.cameras.length} camera(s) from Home Assistant. Recorded-clip scrub needs a Protect NVR — for these, upload or reference a clip.`
@@ -1638,6 +1777,106 @@ function renderHits(groups){
   // results area wiped.
   el.innerHTML = '';
   el.appendChild(grid);
+}
+
+// ---- training data: replay person events + label -------------------------
+let rvTimer = null, rvCards = [];
+
+async function runReview(){
+  const cam = document.getElementById('rvCam').value;
+  const day = document.getElementById('rvDate').value;
+  if(!cam || !day){ msg('rvStatus','pick a camera and a day'); return; }
+  const start = new Date(day + 'T00:00:00');
+  const end = new Date(start.getTime() + 24*3600*1000);
+  const res = await j('api/review', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({camera_id: cam,
+      start: start.toISOString(), end: end.toISOString(),
+      settle_s: parseFloat(document.getElementById('rvSettle').value)})});
+  if(res.error){ msg('rvStatus', res.error); return; }
+  document.getElementById('rvResults').innerHTML = '';
+  rvCards = [];
+  if(rvTimer) clearInterval(rvTimer);
+  rvTimer = setInterval(pollRv, 2000);
+  pollRv();
+}
+
+async function pollRv(){
+  try{
+    const s = await j('api/review/status');
+    if(s.partial.length !== rvCards.length){
+      rvCards = s.partial; renderRv(rvCards);
+    }
+    if(s.running){
+      msg('rvStatus', `replaying visit ${s.progress[0]}/${s.progress[1]}…`);
+      return;
+    }
+    clearInterval(rvTimer); rvTimer = null;
+    if(s.error){ msg('rvStatus', s.error); return; }
+    msg('rvStatus', `${rvCards.length} visit(s) — label away`);
+  }catch(e){ msg('rvStatus','display error: '+e); }
+}
+
+function renderRv(cards){
+  const el = document.getElementById('rvResults');
+  el.innerHTML = '';
+  const grid = document.createElement('div');
+  grid.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:12px;margin-top:10px';
+  const cam = document.getElementById('rvCam').value;
+  cards.forEach((c, ci) => {
+    const card = document.createElement('div');
+    card.id = `rvcard-${ci}`;
+    card.style.cssText = 'border:1px solid var(--line);border-radius:8px;padding:8px';
+    if(c.error){
+      card.innerHTML = `<b>${new Date(c.start).toLocaleTimeString()}</b>
+        <div class="muted">${c.error}</div>`;
+      grid.appendChild(card); return;
+    }
+    const boxes = c.candidates.map((b, i) => {
+      const v = b.verification;
+      const vtxt = !v ? '' : v.error ? ` · <span class="muted">${v.error}</span>`
+        : ` · <span class="${v.accepted?'pass':'fail'}">${v.accepted?'✓':'✗'} “${(v.caption||'').slice(0,60)}”</span>`;
+      return `<label style="display:block;font-size:12px;margin:2px 0">
+        <input type="radio" name="rvbox-${ci}" value="${i}" ${i===0?'checked':''}>
+        #${i+1} conf ${b.confidence}${vtxt}</label>`;
+    }).join('') || '<div class="muted">no candidates found</div>';
+    card.innerHTML = `
+      <div><b>${new Date(c.start).toLocaleTimeString()}–${new Date(c.end).toLocaleTimeString()}</b>
+        <span class="muted">${c.candidates.length} candidate(s)${c.scene_flip?' · lighting flip':''}</span></div>
+      <div style="display:flex;gap:4px;margin-top:4px">
+        <div style="flex:1"><div class="muted">before</div>
+          ${c.before_jpg?`<img src="${c.before_jpg}" style="width:100%;border-radius:5px">`:''}</div>
+        <div style="flex:1"><div class="muted">after</div>
+          ${c.after_jpg?`<img src="${c.after_jpg}" style="width:100%;border-radius:5px">`:''}</div>
+      </div>
+      ${boxes}
+      <div class="row tight" style="gap:6px;margin-top:6px">
+        <button class="primary" onclick="labelEvent(${ci}, 'package')">📦 Package</button>
+        <button onclick="labelEvent(${ci}, 'none')">Ø No package</button>
+        <span class="muted" id="rvmark-${ci}"></span>
+      </div>`;
+    grid.appendChild(card);
+  });
+  el.appendChild(grid);
+}
+
+async function labelEvent(ci, label){
+  const c = rvCards[ci];
+  const cam = document.getElementById('rvCam').value;
+  let box = null, caption = null;
+  const sel = document.querySelector(`input[name="rvbox-${ci}"]:checked`);
+  if(label === 'package' && sel && c.candidates[+sel.value]){
+    box = c.candidates[+sel.value].bbox_norm;
+    const v = c.candidates[+sel.value].verification;
+    caption = v && v.caption || null;
+  }
+  const res = await j('api/label', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({camera_id: cam, event_start: c.start,
+      event_end: c.end, before_path: c.before_path, after_path: c.after_path,
+      label, bbox_norm: box, caption})});
+  msg(`rvmark-${ci}`, res.error ? res.error
+    : `saved (${res.total_labels} labels total)`);
 }
 
 async function verifierStatus(){
